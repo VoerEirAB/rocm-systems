@@ -1940,6 +1940,7 @@ set(_rj_interposer_pm4_tests
     SubmissionFenceQueryRetiresOldHistory
     TransferWaitsForSubmissionWithoutWaitingForCompletion
     GraphicsRegistersRetainAllPacketForms
+    IndexedIndirectDrawsReadStridedArgumentsAndClampCount
     ContextMaskedUpdatesAndTranslationPrefetchPreserveOtherState
     DispatchInterleaveShadowIsQualifiedForGfx12
     ComputeTranslationPrefetchIgnoresPfpSelector
@@ -1972,6 +1973,7 @@ set(_rj_interposer_pm4_tests
     GraphicsQueueAcceptsBufferOwnershipFlushEvents
     ComputeQueueAcceptsPipelineStatisticsControls
     MergedSyncFilesRetainPendingFenceAcrossDupAndImport
+    ThreadDimensionsMaskPartialGroupsForDirectAndIndirectDispatch
     GridProductOverflowFailsFence
     UnmappedShaderFailsFence
     OversizedLdsFailsFence
