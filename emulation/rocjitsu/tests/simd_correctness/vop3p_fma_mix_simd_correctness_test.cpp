@@ -276,7 +276,7 @@ template <uint32_t WF_SIZE, int ArchTag> struct Fixture {
     cfg.lds_size_kb = 64;
     cu = amdgpu::ComputeUnitCore::create("cu_vop3p_fma_mix", cfg, &gpu_mem, &l2);
     decoder = Decoder::create(cfg.arch);
-    wf = cu->dispatch_wf(0, 0, SGPRS_PER_WF, VGPRS_PER_WF);
+    wf = cu->dispatch_wf(0, 0, SGPRS_PER_WF, VGPRS_PER_WF, WF_SIZE);
   }
 
   void seed_vgprs(uint32_t rot, bool widen0, bool widen1, bool widen2, uint64_t exec,
