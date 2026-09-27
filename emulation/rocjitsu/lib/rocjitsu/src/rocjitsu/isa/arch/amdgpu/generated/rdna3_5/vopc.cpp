@@ -45,8 +45,6 @@ VCmpFF16Vopc::VCmpFF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -101,8 +99,6 @@ VCmpLtF16Vopc::VCmpLtF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -157,8 +153,6 @@ VCmpEqF16Vopc::VCmpEqF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -213,8 +207,6 @@ VCmpLeF16Vopc::VCmpLeF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -269,8 +261,6 @@ VCmpGtF16Vopc::VCmpGtF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -325,8 +315,6 @@ VCmpLgF16Vopc::VCmpLgF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -381,8 +369,6 @@ VCmpGeF16Vopc::VCmpGeF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -437,8 +423,6 @@ VCmpOF16Vopc::VCmpOF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -493,8 +477,6 @@ VCmpUF16Vopc::VCmpUF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -549,8 +531,6 @@ VCmpNgeF16Vopc::VCmpNgeF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -605,8 +585,6 @@ VCmpNlgF16Vopc::VCmpNlgF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -661,8 +639,6 @@ VCmpNgtF16Vopc::VCmpNgtF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -717,8 +693,6 @@ VCmpNleF16Vopc::VCmpNleF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -773,8 +747,6 @@ VCmpNeqF16Vopc::VCmpNeqF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -829,8 +801,6 @@ VCmpNltF16Vopc::VCmpNltF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -885,8 +855,6 @@ VCmpTF16Vopc::VCmpTF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -938,8 +906,6 @@ VCmpFF32Vopc::VCmpFF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -991,8 +957,6 @@ VCmpLtF32Vopc::VCmpLtF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1044,8 +1008,6 @@ VCmpEqF32Vopc::VCmpEqF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1097,8 +1059,6 @@ VCmpLeF32Vopc::VCmpLeF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1150,8 +1110,6 @@ VCmpGtF32Vopc::VCmpGtF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1203,8 +1161,6 @@ VCmpLgF32Vopc::VCmpLgF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1256,8 +1212,6 @@ VCmpGeF32Vopc::VCmpGeF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1309,8 +1263,6 @@ VCmpOF32Vopc::VCmpOF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1362,8 +1314,6 @@ VCmpUF32Vopc::VCmpUF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1415,8 +1365,6 @@ VCmpNgeF32Vopc::VCmpNgeF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1468,8 +1416,6 @@ VCmpNlgF32Vopc::VCmpNlgF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1521,8 +1467,6 @@ VCmpNgtF32Vopc::VCmpNgtF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1574,8 +1518,6 @@ VCmpNleF32Vopc::VCmpNleF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1627,8 +1569,6 @@ VCmpNeqF32Vopc::VCmpNeqF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1680,8 +1620,6 @@ VCmpNltF32Vopc::VCmpNltF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -1733,8 +1671,6 @@ VCmpTF32Vopc::VCmpTF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2317,8 +2253,6 @@ VCmpLtI16Vopc::VCmpLtI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2373,8 +2307,6 @@ VCmpEqI16Vopc::VCmpEqI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2429,8 +2361,6 @@ VCmpLeI16Vopc::VCmpLeI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2485,8 +2415,6 @@ VCmpGtI16Vopc::VCmpGtI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2541,8 +2469,6 @@ VCmpNeI16Vopc::VCmpNeI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2597,8 +2523,6 @@ VCmpGeI16Vopc::VCmpGeI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2653,8 +2577,6 @@ VCmpLtU16Vopc::VCmpLtU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2709,8 +2631,6 @@ VCmpEqU16Vopc::VCmpEqU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2765,8 +2685,6 @@ VCmpLeU16Vopc::VCmpLeU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2821,8 +2739,6 @@ VCmpGtU16Vopc::VCmpGtU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2877,8 +2793,6 @@ VCmpNeU16Vopc::VCmpNeU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2933,8 +2847,6 @@ VCmpGeU16Vopc::VCmpGeU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -2986,8 +2898,6 @@ VCmpFI32Vopc::VCmpFI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3039,8 +2949,6 @@ VCmpLtI32Vopc::VCmpLtI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3092,8 +3000,6 @@ VCmpEqI32Vopc::VCmpEqI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3145,8 +3051,6 @@ VCmpLeI32Vopc::VCmpLeI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3198,8 +3102,6 @@ VCmpGtI32Vopc::VCmpGtI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3251,8 +3153,6 @@ VCmpNeI32Vopc::VCmpNeI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3304,8 +3204,6 @@ VCmpGeI32Vopc::VCmpGeI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3357,8 +3255,6 @@ VCmpTI32Vopc::VCmpTI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3410,8 +3306,6 @@ VCmpFU32Vopc::VCmpFU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3463,8 +3357,6 @@ VCmpLtU32Vopc::VCmpLtU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3516,8 +3408,6 @@ VCmpEqU32Vopc::VCmpEqU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3569,8 +3459,6 @@ VCmpLeU32Vopc::VCmpLeU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3622,8 +3510,6 @@ VCmpGtU32Vopc::VCmpGtU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3675,8 +3561,6 @@ VCmpNeU32Vopc::VCmpNeU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3728,8 +3612,6 @@ VCmpGeU32Vopc::VCmpGeU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -3781,8 +3663,6 @@ VCmpTU32Vopc::VCmpTU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -4365,8 +4245,6 @@ VCmpClassF16Vopc::VCmpClassF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -4419,8 +4297,6 @@ VCmpClassF32Vopc::VCmpClassF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   vcc.apply_fieldless_caps(false, false, false);
@@ -4512,8 +4388,6 @@ VCmpxFF16Vopc::VCmpxFF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4572,8 +4446,6 @@ VCmpxLtF16Vopc::VCmpxLtF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4632,8 +4504,6 @@ VCmpxEqF16Vopc::VCmpxEqF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4692,8 +4562,6 @@ VCmpxLeF16Vopc::VCmpxLeF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4752,8 +4620,6 @@ VCmpxGtF16Vopc::VCmpxGtF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4812,8 +4678,6 @@ VCmpxLgF16Vopc::VCmpxLgF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4872,8 +4736,6 @@ VCmpxGeF16Vopc::VCmpxGeF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4932,8 +4794,6 @@ VCmpxOF16Vopc::VCmpxOF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -4992,8 +4852,6 @@ VCmpxUF16Vopc::VCmpxUF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5052,8 +4910,6 @@ VCmpxNgeF16Vopc::VCmpxNgeF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5113,8 +4969,6 @@ VCmpxNlgF16Vopc::VCmpxNlgF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5174,8 +5028,6 @@ VCmpxNgtF16Vopc::VCmpxNgtF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5235,8 +5087,6 @@ VCmpxNleF16Vopc::VCmpxNleF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5296,8 +5146,6 @@ VCmpxNeqF16Vopc::VCmpxNeqF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5357,8 +5205,6 @@ VCmpxNltF16Vopc::VCmpxNltF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5418,8 +5264,6 @@ VCmpxTF16Vopc::VCmpxTF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5475,8 +5319,6 @@ VCmpxFF32Vopc::VCmpxFF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5532,8 +5374,6 @@ VCmpxLtF32Vopc::VCmpxLtF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5589,8 +5429,6 @@ VCmpxEqF32Vopc::VCmpxEqF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5646,8 +5484,6 @@ VCmpxLeF32Vopc::VCmpxLeF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5703,8 +5539,6 @@ VCmpxGtF32Vopc::VCmpxGtF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5760,8 +5594,6 @@ VCmpxLgF32Vopc::VCmpxLgF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5817,8 +5649,6 @@ VCmpxGeF32Vopc::VCmpxGeF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5874,8 +5704,6 @@ VCmpxOF32Vopc::VCmpxOF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5931,8 +5759,6 @@ VCmpxUF32Vopc::VCmpxUF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -5988,8 +5814,6 @@ VCmpxNgeF32Vopc::VCmpxNgeF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6046,8 +5870,6 @@ VCmpxNlgF32Vopc::VCmpxNlgF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6104,8 +5926,6 @@ VCmpxNgtF32Vopc::VCmpxNgtF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6162,8 +5982,6 @@ VCmpxNleF32Vopc::VCmpxNleF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6220,8 +6038,6 @@ VCmpxNeqF32Vopc::VCmpxNeqF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6278,8 +6094,6 @@ VCmpxNltF32Vopc::VCmpxNltF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6336,8 +6150,6 @@ VCmpxTF32Vopc::VCmpxTF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -6994,8 +6806,6 @@ VCmpxLtI16Vopc::VCmpxLtI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7054,8 +6864,6 @@ VCmpxEqI16Vopc::VCmpxEqI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7114,8 +6922,6 @@ VCmpxLeI16Vopc::VCmpxLeI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7174,8 +6980,6 @@ VCmpxGtI16Vopc::VCmpxGtI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7234,8 +7038,6 @@ VCmpxNeI16Vopc::VCmpxNeI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7294,8 +7096,6 @@ VCmpxGeI16Vopc::VCmpxGeI16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7354,8 +7154,6 @@ VCmpxLtU16Vopc::VCmpxLtU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7414,8 +7212,6 @@ VCmpxEqU16Vopc::VCmpxEqU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7474,8 +7270,6 @@ VCmpxLeU16Vopc::VCmpxLeU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7534,8 +7328,6 @@ VCmpxGtU16Vopc::VCmpxGtU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7594,8 +7386,6 @@ VCmpxNeU16Vopc::VCmpxNeU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7654,8 +7444,6 @@ VCmpxGeU16Vopc::VCmpxGeU16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7711,8 +7499,6 @@ VCmpxFI32Vopc::VCmpxFI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7768,8 +7554,6 @@ VCmpxLtI32Vopc::VCmpxLtI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7825,8 +7609,6 @@ VCmpxEqI32Vopc::VCmpxEqI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7882,8 +7664,6 @@ VCmpxLeI32Vopc::VCmpxLeI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7939,8 +7719,6 @@ VCmpxGtI32Vopc::VCmpxGtI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -7996,8 +7774,6 @@ VCmpxNeI32Vopc::VCmpxNeI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8053,8 +7829,6 @@ VCmpxGeI32Vopc::VCmpxGeI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8110,8 +7884,6 @@ VCmpxTI32Vopc::VCmpxTI32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8167,8 +7939,6 @@ VCmpxFU32Vopc::VCmpxFU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8224,8 +7994,6 @@ VCmpxLtU32Vopc::VCmpxLtU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8281,8 +8049,6 @@ VCmpxEqU32Vopc::VCmpxEqU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8338,8 +8104,6 @@ VCmpxLeU32Vopc::VCmpxLeU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8395,8 +8159,6 @@ VCmpxGtU32Vopc::VCmpxGtU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8452,8 +8214,6 @@ VCmpxNeU32Vopc::VCmpxNeU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8509,8 +8269,6 @@ VCmpxGeU32Vopc::VCmpxGeU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -8566,8 +8324,6 @@ VCmpxTU32Vopc::VCmpxTU32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -9218,8 +8974,6 @@ VCmpxClassF16Vopc::VCmpxClassF16Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);
@@ -9276,8 +9030,6 @@ VCmpxClassF32Vopc::VCmpxClassF32Vopc(const MachineInst *inst)
     dpp_row_mask_ = dp->row_mask;
     dpp_bank_mask_ = dp->bank_mask;
     dpp_bound_ctrl_ = dp->bound_ctrl;
-    dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);
-    dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);
     dpp_fi_ = dp->fi;
   }
   exec.apply_fieldless_caps(false, false, false);

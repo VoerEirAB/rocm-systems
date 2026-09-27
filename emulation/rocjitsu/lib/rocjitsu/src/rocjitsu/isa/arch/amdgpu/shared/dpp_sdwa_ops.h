@@ -507,8 +507,10 @@ inline void apply_dpp(const Operand &source, const DppPlan &plan, uint64_t read_
 /// Apply the DPP16 extension's floating source modifiers after permutation.
 /// Stage an unpermuted second source only when it has a modifier.
 inline void apply_source_modifiers(const Operand &source, std::optional<StagedOperand> &storage,
-                                   amdgpu::Wavefront &wf, uint64_t sign, bool absolute,
-                                   bool negate) {
+                                   amdgpu::Wavefront &wf, uint64_t sign, SourceModifiers modifiers,
+                                   uint32_t source_index) {
+  const bool absolute = modifiers.absolute & (1u << source_index);
+  const bool negate = modifiers.negate & (1u << source_index);
   if (!absolute && !negate)
     return;
   if (!storage) {

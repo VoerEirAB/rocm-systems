@@ -4068,6 +4068,12 @@ class CodeGenerator:
                     ' std::memcpy(raw_words_.data(), inst, size_);'
                     ' raw_encoding_ = raw_words_.data();'
                 )
+            if dpp_opcodes and enc_upper in ('ENC_VOP1', 'ENC_VOP2', 'ENC_VOPC'):
+                size_line += (
+                    ' if (has_encoded_dpp())'
+                    ' dpp_modifiers_ = amdgpu::dpp::SourceModifiers::decode('
+                    f'*reinterpret_cast<const {dpp_struct} *>(inst));'
+                )
             if supports_fixed_size_embedding:
                 size_line += ' }'
                 validation_body += ' }'
@@ -4466,8 +4472,9 @@ class CodeGenerator:
                 if _dpp8_struct:
                     class_members.append(cgen.Statement('uint32_t dpp8_lane_sel_ = 0'))
             if _enc_upper in ('ENC_VOP1', 'ENC_VOP2', 'ENC_VOPC'):
-                class_members.append(cgen.Statement('uint32_t dpp_abs_ = 0'))
-                class_members.append(cgen.Statement('uint32_t dpp_neg_ = 0'))
+                class_members.append(
+                    cgen.Statement('amdgpu::dpp::SourceModifiers dpp_modifiers_')
+                )
                 # SDWA fields (CDNA and RDNA1/2 have hardware SDWA encoding; fields
                 # are present on all ISAs for uniform codegen even if unused).
                 class_members.append(
@@ -11637,13 +11644,6 @@ class CodeGenerator:
                                 # storing them on the Instruction base for
                                 # apply_dpp() to use later.
                                 if _dpp_struct and _supports_dpp_encoding:
-                                    _dpp_source_modifiers = (
-                                        ' dpp_abs_ = dp->src0_abs | (dp->src1_abs << 1);'
-                                        ' dpp_neg_ = dp->src0_neg | (dp->src1_neg << 1);'
-                                        if enc.enc_name.upper()
-                                        in ('ENC_VOP1', 'ENC_VOP2', 'ENC_VOPC')
-                                        else ''
-                                    )
                                     _dpp_feature_mask = self._modifier_feature_mask(
                                         inst, _modifier_enc_name, 'dpp'
                                     )
@@ -11676,7 +11676,6 @@ class CodeGenerator:
                                             f' dpp_row_mask_ = dp->row_mask;'
                                             f' dpp_bank_mask_ = dp->bank_mask;'
                                             f' dpp_bound_ctrl_ = dp->bound_ctrl;'
-                                            f'{_dpp_source_modifiers}'
                                             f'{_dpp_fi_ctor_stmt}'
                                             f'{_dpp_feature_stmt}'
                                             f'}}'
@@ -11753,7 +11752,6 @@ class CodeGenerator:
                                         f' dpp_row_mask_ = dp->row_mask;'
                                         f' dpp_bank_mask_ = dp->bank_mask;'
                                         f' dpp_bound_ctrl_ = dp->bound_ctrl;'
-                                        f'{_dpp_source_modifiers}'
                                         f'{_dpp_fi_ctor_stmt}'
                                         f'{_dpp_feature_stmt}'
                                         f'}}'
@@ -12441,9 +12439,8 @@ class CodeGenerator:
                                 if sign:
                                     source = _src_input_ops[index].name
                                     _dpp_preamble += (
-                                        '  if (inst_.src0 == amdgpu::SRC_DPP)\n'
-                                        f'    amdgpu::dpp::apply_source_modifiers({source}, dpp_src{index}_, wf,\n'
-                                        f'        {sign}ull, dpp_abs_ & {1 << index}u, dpp_neg_ & {1 << index}u);\n'
+                                        f'  amdgpu::dpp::apply_source_modifiers({source}, dpp_src{index}_, wf,\n'
+                                        f'      {sign}ull, dpp_modifiers_, {index});\n'
                                     )
                             if not _semantic_stages_src0:
                                 _dpp_preamble += (

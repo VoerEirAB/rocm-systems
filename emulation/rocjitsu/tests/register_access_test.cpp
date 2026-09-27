@@ -1331,7 +1331,7 @@ TEST(RegisterAccessTest, Packed16DppObservesSelectedPhysicalLanesAndHalves) {
   }
   staged.reset();
   fx.plugin->reads.clear();
-  dpp::apply_source_modifiers(source, staged, *fx.wf, 0x8000, true, false);
+  dpp::apply_source_modifiers(source, staged, *fx.wf, 0x8000, {.absolute = 1}, 0);
   ASSERT_TRUE(staged.has_value());
   EXPECT_EQ(regs.read_lane(*staged, 0), 0x4000u);
   EXPECT_EQ(regs.read_lane(*staged, 2), 0x4002u);
