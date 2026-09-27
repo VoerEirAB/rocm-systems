@@ -194,39 +194,69 @@ static_assert((util::detail::kAmdgpuRsqCorrections[0] & 0x7fff) != 0);
 static_assert((util::detail::kAmdgpuRsqCorrections[util::detail::kAmdgpuRsqCorrectionOffsets[256]] &
                0x7fff) != 0);
 
-#define ATTR __attribute__((target("avx512f"), always_inline))
 using V = __m512i;
 using M = __mmask8;
-ATTR inline V set(uint64_t a) { return _mm512_set1_epi64(static_cast<long long>(a)); }
-ATTR inline V add(V a, V b) { return _mm512_add_epi64(a, b); }
-ATTR inline V sub(V a, V b) { return _mm512_sub_epi64(a, b); }
-ATTR inline V band(V a, V b) { return _mm512_and_si512(a, b); }
-ATTR inline V bor(V a, V b) { return _mm512_or_si512(a, b); }
-ATTR inline V bxor(V a, V b) { return _mm512_xor_si512(a, b); }
-ATTR inline V multiply_low32(V a, V b) { return _mm512_mul_epu32(a, b); }
-ATTR inline V shr_each(V a, V b) { return _mm512_srlv_epi64(a, b); }
-ATTR inline V shl_each(V a, V b) { return _mm512_sllv_epi64(a, b); }
-ATTR inline V shr(V a, unsigned n) { return shr_each(a, set(n)); }
-ATTR inline V shl(V a, unsigned n) { return shl_each(a, set(n)); }
-ATTR inline M gt(V a, V b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_GT); }
-ATTR inline M eq(V a, V b) { return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_EQ); }
-ATTR inline M mand(M a, M b) { return a & b; }
-ATTR inline M mor(M a, M b) { return a | b; }
-ATTR inline M mnot(M a) { return static_cast<M>(~a); }
-ATTR inline bool any(M a) { return a != 0; }
-ATTR inline V select(M mask, V yes, V no) { return _mm512_mask_blend_epi64(mask, no, yes); }
-ATTR inline V gather_masked(const long long *p, V index, M mask) {
+[[gnu::target("avx512f"), gnu::always_inline]] inline V set(uint64_t a) {
+  return _mm512_set1_epi64(static_cast<long long>(a));
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V add(V a, V b) {
+  return _mm512_add_epi64(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V sub(V a, V b) {
+  return _mm512_sub_epi64(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V band(V a, V b) {
+  return _mm512_and_si512(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V bor(V a, V b) {
+  return _mm512_or_si512(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V bxor(V a, V b) {
+  return _mm512_xor_si512(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V multiply_low32(V a, V b) {
+  return _mm512_mul_epu32(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V shr_each(V a, V b) {
+  return _mm512_srlv_epi64(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V shl_each(V a, V b) {
+  return _mm512_sllv_epi64(a, b);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V shr(V a, unsigned n) {
+  return shr_each(a, set(n));
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V shl(V a, unsigned n) {
+  return shl_each(a, set(n));
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline M gt(V a, V b) {
+  return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_GT);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline M eq(V a, V b) {
+  return _mm512_cmp_epi64_mask(a, b, _MM_CMPINT_EQ);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline M mand(M a, M b) { return a & b; }
+[[gnu::target("avx512f"), gnu::always_inline]] inline M mor(M a, M b) { return a | b; }
+[[gnu::target("avx512f"), gnu::always_inline]] inline M mnot(M a) { return static_cast<M>(~a); }
+[[gnu::target("avx512f"), gnu::always_inline]] inline bool any(M a) { return a != 0; }
+[[gnu::target("avx512f"), gnu::always_inline]] inline V select(M mask, V yes, V no) {
+  return _mm512_mask_blend_epi64(mask, no, yes);
+}
+[[gnu::target("avx512f"), gnu::always_inline]] inline V gather_masked(const long long *p, V index,
+                                                                      M mask) {
   return _mm512_mask_i64gather_epi64(set(0), mask, index, p, 8);
 }
-ATTR inline V gather32_masked(const uint32_t *p, V index, M mask) {
+[[gnu::target("avx512f"), gnu::always_inline]] inline V gather32_masked(const uint32_t *p, V index,
+                                                                        M mask) {
   return _mm512_cvtepu32_epi64(
       _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), mask, index, p, 4));
 }
-ATTR inline V load(const uint32_t *p) {
+[[gnu::target("avx512f"), gnu::always_inline]] inline V load(const uint32_t *p) {
   return _mm512_cvtepu32_epi64(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(p)));
 }
 
-ATTR inline V normalized(V index, bool rsq, const Tables &table, M useful) {
+[[gnu::target("avx512f"), gnu::always_inline]] inline V normalized(V index, bool rsq,
+                                                                   const Tables &table, M useful) {
   const V zero = set(0), one = set(1);
   const V segment = shr(index, 18);
   const V packed = gather_masked(table.constant_linear, segment, useful);
@@ -278,8 +308,8 @@ ATTR inline V normalized(V index, bool rsq, const Tables &table, M useful) {
 
 // Called only after feature admission and for complete eight-lane chunks.
 // Integer arithmetic leaves host FP control, sticky flags and errno untouched.
-__attribute__((target("avx512f"))) void
-evaluate_reciprocal_f32_simd(bool rsq, const uint32_t *input, uint32_t *output, size_t count) {
+[[gnu::target("avx512f")]] void evaluate_reciprocal_f32_simd(bool rsq, const uint32_t *input,
+                                                             uint32_t *output, size_t count) {
   const Tables &table = rsq ? rsq_tables : rcp_tables;
   const V zero = set(0), sign_mask = set(0x80000000), magnitude_mask = set(0x7fffffff);
   for (size_t start = 0; start < count; start += 8) {
@@ -315,6 +345,5 @@ evaluate_reciprocal_f32_simd(bool rsq, const uint32_t *input, uint32_t *output, 
     _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + start), _mm512_cvtepi64_epi32(result));
   }
 }
-#undef ATTR
 } // namespace rocjitsu::amdgpu::transcendental::detail
 #endif

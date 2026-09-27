@@ -10,6 +10,7 @@
 #include "rocjitsu/vm/amdgpu/pm4.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -35,7 +36,8 @@ public:
   /// Advance only after the preceding shader dispatch has retired and caches are flushed.
   /// RAM read batching requires a caller with no observers or active debugging.
   std::optional<DispatchEntry> advance(const GpuVmAccess &memory, CpuDispatchPool *pool = nullptr,
-                                       uint32_t threads = 1, bool allow_ram_read_batching = false);
+                                       uint32_t threads = 1, bool allow_ram_read_batching = false,
+                                       bool allow_early_depth = false);
   bool fragment_stage() const { return fragment_stage_; }
   std::shared_ptr<GsRegisters> gs_registers() const override {
     return fragment_stage_ ? nullptr : gs_registers_;
@@ -73,20 +75,38 @@ private:
     std::array<uint32_t, 4> values{};
   };
   struct Fragment {
-    int32_t x = 0, y = 0;
-    float i = 0, j = 0, z = 0;
-    float linear_i = 0, linear_j = 0;
-    std::array<float, 3> pull_model{};
-    bool covered = false;
-    std::array<ColorExport, kColorTargets> exports{};
+    int32_t x, y;
+    float i, j, z;
+    float linear_i, linear_j;
+    std::array<float, 3> pull_model;
+    bool covered;
   };
-  struct FragmentWave {
-    std::array<Fragment, 64> lanes{};
+  class FragmentWave {
+  public:
+    struct InterpolatedLanes {};
+    FragmentWave() noexcept : lanes{} {}
+    // Only the reserved parallel raster batch may defer its live prefix.
+    // Interpolation writes every field before the wave can move or be read.
+    FragmentWave(InterpolatedLanes, uint32_t live_lanes) noexcept {
+      for (std::size_t lane = live_lanes; lane < lanes.size(); ++lane)
+        lanes[lane] = {};
+    }
+    std::array<Fragment, 64> lanes;
     std::vector<uint32_t> parameters;
+    std::size_t export_offset = static_cast<std::size_t>(-1);
     uint32_t relative_layer = 0;
     bool front = true;
   };
   std::vector<FragmentWave> fragments_;
+  // Color exports are private output state, separate from raster geometry.
+  // Slots are fixed before FS publication; each wave owns 64 records per slot.
+  std::vector<ColorExport> fragment_exports_;
+  std::array<uint8_t, kColorTargets> export_slots_{};
+  bool fragment_exports_prepared_ = false;
+  // Keep original output order, including the late depth visit of omitted waves.
+  std::vector<uint32_t> fragment_dispatch_indices_;
+  bool fragment_selection_active_ = false;
+  bool early_depth_state_ = false;
   bool fragment_stage_ = false;
   uint32_t fragment_wave_size_ = 0;
   struct ColorAttachment {
@@ -122,6 +142,11 @@ private:
   bool attachments_prepared_ = false;
   void finish_vertices(const VertexGroup &group);
   DispatchEntry fragment_dispatch() const;
+  void prepare_fragment_exports();
+  const ColorExport &fragment_export(const FragmentWave &batch, uint32_t lane,
+                                     uint32_t target) const;
+  FragmentWave &fragment_for_dispatch(uint32_t workgroup);
+  bool select_fragment_waves(const GpuVmAccess &memory);
   void prepare_colors();
   void prepare_attachments();
   bool try_gather_attributes(const GpuVmAccess &memory, const VertexGroup &group,

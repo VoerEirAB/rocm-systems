@@ -112,6 +112,91 @@ double round_even(double value) {
   return lo + (fraction > 0.5 || (fraction == 0.5 && std::fmod(lo, 2.0) != 0));
 }
 
+uint32_t encode_filtered_unorm(uint64_t rounded_unorm, uint32_t unorm_width) {
+  // Normalize by repeating eight- or ten-bit fields, then round the 34
+  // fractional bits to FP32 with midpoints rounded up. This is the existing
+  // texture normalization, not ordinary division by the UNORM maximum.
+  const uint64_t numerator = rounded_unorm << (34 - 13 - unorm_width);
+  uint64_t normalized = 0;
+  for (uint32_t offset = 0; offset < 34; offset += unorm_width)
+    normalized += numerator >> offset;
+  const uint32_t bits = std::bit_width(normalized);
+  const uint32_t shift = bits > 24 ? bits - 24 : 0;
+  if (shift)
+    normalized = (normalized + (uint64_t{1} << (shift - 1))) >> shift;
+  if (!normalized)
+    return 0;
+  const uint32_t leading = std::bit_width(normalized) - 1;
+  const uint32_t significand = static_cast<uint32_t>((normalized << (63 - leading)) >> 40);
+  const uint32_t exponent = leading + shift + (127 - 34);
+  return (exponent << 23) | (significand & 0x7fffffu);
+}
+
+// Inspect bits without converting a nonintegral value or touching host FP
+// flags. Preparation emits fractions in [0,1] at exact multiples of 1/256;
+// externally supplied or observer-modified fractions retain the general path.
+bool sample_fraction_q8(float value, uint32_t &result) {
+  const uint32_t bits = std::bit_cast<uint32_t>(value);
+  if (!(bits & 0x7fffffffu)) {
+    result = 0;
+    return true;
+  }
+  const uint32_t exponent = (bits >> 23) & 255;
+  if ((bits >> 31) || exponent < 119 || exponent > 127)
+    return false;
+  const uint32_t shift = 142 - exponent;
+  const uint32_t significand = (bits & 0x7fffffu) | 0x800000u;
+  if (significand & ((1u << shift) - 1))
+    return false;
+  result = significand >> shift;
+  return result <= 256;
+}
+
+uint32_t round_even_shift(uint32_t value, uint32_t shift) {
+  const uint32_t integer = value >> shift;
+  const uint32_t remainder = value & ((uint32_t{1} << shift) - 1);
+  const uint32_t half = uint32_t{1} << (shift - 1);
+  return integer + (remainder > half || (remainder == half && (integer & 1)));
+}
+
+bool filter_unorm8_single(const ImageSampleAccess &access, uint32_t lane, uint32_t components,
+                          std::span<const std::array<uint32_t, 4>> texels,
+                          std::array<uint32_t, 4> &values) {
+  if (access.filter_counts[lane] != 1 || access.texels_per_tap != 1 ||
+      (access.taps_per_filter != 4 && access.taps_per_filter != 8))
+    return false;
+  const uint32_t levels = access.taps_per_filter / 4;
+  std::array<std::array<uint32_t, 4>, 2> weights;
+  uint32_t mip = 0;
+  if (levels == 2 && !sample_fraction_q8(access.mip_fractions[lane], mip))
+    return false;
+  for (uint32_t level = 0; level < levels; ++level) {
+    uint32_t x, y;
+    if (access.filters[0].cube_corners[lane][level] ||
+        !sample_fraction_q8(access.filters[0].fractions[lane][level][0], x) ||
+        !sample_fraction_q8(access.filters[0].fractions[lane][level][1], y))
+      return false;
+    weights[level] = {(256 - x) * (256 - y), x * (256 - y), (256 - x) * y, x * y};
+  }
+  for (uint32_t c = 0; c < components; ++c) {
+    std::array<uint32_t, 2> filtered{};
+    for (uint32_t level = 0; level < levels; ++level)
+      for (uint32_t tap = 0; tap < 4; ++tap)
+        filtered[level] += texels[4 * level + tap][c] * weights[level][tap];
+    // UNORM8 texels are at most 255; Q16 weights sum to 65536. Each
+    // level is at most 255 * 2^16, and either mip product is below 2^32.
+    // Round each mip contribution separately to Q19, exactly as the double
+    // path does. A single level retains Q16 until the final Q13 rounding.
+    const uint32_t rounded = levels == 2
+                                 ? round_even_shift(round_even_shift(filtered[0] * (256 - mip), 5) +
+                                                        round_even_shift(filtered[1] * mip, 5),
+                                                    6)
+                                 : round_even_shift(filtered[0], 3);
+    values[c] = encode_filtered_unorm(rounded, 8);
+  }
+  return true;
+}
+
 constexpr float kFilterNan = std::bit_cast<float>(0xffc00000u);
 
 double filter_float_texels(std::array<double, 4> channels, const std::array<double, 4> &weights,
@@ -450,12 +535,19 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
       d.image_sample && d.image_sample->tap_count >= 4 && !d.image_srgb &&
       format.number == Number::Unorm && format.widths[0] == 8 &&
       std::ranges::all_of(format.widths, [](uint32_t width) { return width == 0 || width == 8; });
+  // The first active lane touches every destination register with the original
+  // arithmetic state, including any lazy-storage allocation. Later VGPR lanes
+  // reuse those chunks. LDS can still grow at later lanes, so retain its filter.
+  const bool integer_filter =
+      unorm8_texels && !d.lds_dst && !cu.observes_register_access() && !cu.debug_active();
+  bool destinations_materialized = false;
   std::array<uint32_t, 4> channel_offsets{};
   for (uint32_t c = 1; c < channel_offsets.size(); ++c)
     channel_offsets[c] = channel_offsets[c - 1] + format.widths[c - 1] / 8;
   for (uint32_t lane = 0; lane < d.wf_size; ++lane) {
     if (!(d.exec_mask & (1ULL << lane)))
       continue;
+    const bool integer_texels = integer_filter && destinations_materialized;
     const auto texel = [&](uint32_t tap) {
       const bool valid = d.lane_mask & (uint64_t{1} << lane);
       const bool border =
@@ -465,7 +557,7 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
                                    .subspan((tap * d.wf_size + lane) * d.elem_size, d.elem_size)
                              : std::span<const uint8_t>{};
       std::array<uint32_t, 4> values{};
-      if (unorm8_texels) {
+      if (integer_texels) {
         for (uint32_t c = 0; c < d.buffer_components; ++c) {
           const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
           if (selector == 1) {
@@ -518,147 +610,130 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
       texels[0] = values;
       for (uint32_t tap = 1; tap < tap_count; ++tap)
         texels[tap] = texel(tap);
-      std::array<std::array<std::array<double, 4>, 2>, ImageSampleAccess::kMaxFilters> weights;
-      const uint32_t levels =
-          d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap ? 2 : 1;
-      for (uint32_t filter = 0; filter < filter_count; ++filter)
-        for (uint32_t level = 0; level < levels; ++level) {
-          const double x = d.image_sample->filters[filter].fractions[lane][level][0];
-          const double y = d.image_sample->filters[filter].fractions[lane][level][1];
-          weights[filter][level] = {(1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y};
-        }
-      for (uint32_t c = 0; c < d.buffer_components; ++c) {
-        const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
-        const bool fixed_unorm = format.number == Number::Unorm &&
-                                 (format.widths[0] == 8 || format.widths[0] == 10) &&
-                                 (!d.image_srgb || selector == 7);
-        const uint32_t unorm_width = format.widths[0] == 10 ? 10 : 8;
-        const uint32_t unorm_max = (1u << unorm_width) - 1;
-        const auto filter_sample = [&](uint32_t filter_index) {
-          const auto filter_level = [&](uint32_t level) {
-            std::array<double, 4> channels{};
-            const auto &access = *d.image_sample;
-            const uint32_t corners = access.filters[filter_index].cube_corners[lane][level];
-            for (uint32_t tap = 0; tap < 4; ++tap) {
-              const uint32_t first =
-                  filter_index * access.taps_per_filter + (level * 4 + tap) * access.texels_per_tap;
-              const auto channel = [&](uint32_t source) {
-                if (unorm8_texels)
-                  return double(texels[first + source][c]);
-                const double value = std::bit_cast<float>(texels[first + source][c]);
-                return fixed_unorm ? round_even(value * unorm_max) : value;
-              };
-              channels[tap] = channel(0);
-              if (corners & (1u << tap))
-                channels[tap] =
-                    (channels[tap] * 21846 + channel(1) * 21845 + channel(2) * 21845) / 65536;
+      if (!(integer_texels && filter_unorm8_single(*d.image_sample, lane, d.buffer_components,
+                                                   std::span(texels).first(tap_count), values))) {
+        std::array<std::array<std::array<double, 4>, 2>, ImageSampleAccess::kMaxFilters> weights;
+        const uint32_t levels =
+            d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap ? 2 : 1;
+        for (uint32_t filter = 0; filter < filter_count; ++filter)
+          for (uint32_t level = 0; level < levels; ++level) {
+            const double x = d.image_sample->filters[filter].fractions[lane][level][0];
+            const double y = d.image_sample->filters[filter].fractions[lane][level][1];
+            weights[filter][level] = {(1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y};
+          }
+        for (uint32_t c = 0; c < d.buffer_components; ++c) {
+          const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
+          const bool fixed_unorm = format.number == Number::Unorm &&
+                                   (format.widths[0] == 8 || format.widths[0] == 10) &&
+                                   (!d.image_srgb || selector == 7);
+          const uint32_t unorm_width = format.widths[0] == 10 ? 10 : 8;
+          const uint32_t unorm_max = (1u << unorm_width) - 1;
+          const auto filter_sample = [&](uint32_t filter_index) {
+            const auto filter_level = [&](uint32_t level) {
+              std::array<double, 4> channels{};
+              const auto &access = *d.image_sample;
+              const uint32_t corners = access.filters[filter_index].cube_corners[lane][level];
+              for (uint32_t tap = 0; tap < 4; ++tap) {
+                const uint32_t first = filter_index * access.taps_per_filter +
+                                       (level * 4 + tap) * access.texels_per_tap;
+                const auto channel = [&](uint32_t source) {
+                  if (integer_texels)
+                    return double(texels[first + source][c]);
+                  const double value = std::bit_cast<float>(texels[first + source][c]);
+                  return fixed_unorm ? round_even(value * unorm_max) : value;
+                };
+                channels[tap] = channel(0);
+                if (corners & (1u << tap))
+                  channels[tap] =
+                      (channels[tap] * 21846 + channel(1) * 21845 + channel(2) * 21845) / 65536;
+              }
+              const auto &level_weights = weights[filter_index][level];
+              if (!fixed_unorm)
+                return filter_float_texels(
+                    channels, level_weights, corners,
+                    format.number == Number::Float && format.widths[0] == 32 ? 25 : 12);
+              return channels[0] * level_weights[0] + channels[1] * level_weights[1] +
+                     channels[2] * level_weights[2] + channels[3] * level_weights[3];
+            };
+            double filtered = filter_level(0);
+            if (d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap) {
+              const double fraction = d.image_sample->mip_fractions[lane];
+              if (fixed_unorm) {
+                // Each weighted mip retains nineteen fractional texel-value bits
+                // before the two contributions are added. Fixed texel values
+                // and Q8 fractions keep these binary scales exact and normal.
+                filtered = (round_even(filtered * (1 - fraction) * 0x1p19) +
+                            round_even(filter_level(1) * fraction * 0x1p19)) *
+                           0x1p-19;
+              } else {
+                // Do not multiply an unused mip's NaN/infinity by zero, or lose
+                // signed zero at an exact mip level.
+                if (fraction == 1)
+                  filtered = filter_level(1);
+                else if (fraction != 0)
+                  filtered = 0.0 + filtered * (1 - fraction) + filter_level(1) * fraction;
+                if (std::isnan(filtered))
+                  filtered = kFilterNan;
+              }
             }
-            const auto &level_weights = weights[filter_index][level];
-            if (!fixed_unorm)
-              return filter_float_texels(
-                  channels, level_weights, corners,
-                  format.number == Number::Float && format.widths[0] == 32 ? 25 : 12);
-            return channels[0] * level_weights[0] + channels[1] * level_weights[1] +
-                   channels[2] * level_weights[2] + channels[3] * level_weights[3];
+            return filtered;
           };
-          double filtered = filter_level(0);
-          if (d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap) {
-            const double fraction = d.image_sample->mip_fractions[lane];
+          double filtered;
+          int accumulation_exponent = 0;
+          if (filter_count > 1) {
+            const auto weighted_filter = [&](uint32_t index) {
+              const double value =
+                  filter_sample(index) * image_anisotropic_filter_weight(filter_count, index);
+              // The UNORM accumulator normalizes after summation. Each weighted
+              // contribution retains nineteen fractional texel-value bits.
+              return fixed_unorm
+                         ? round_even(value * std::bit_floor(filter_count) * 0x1p19) * 0x1p-19
+                         : value;
+            };
+            filtered = weighted_filter(0);
             if (fixed_unorm) {
-              // Each weighted mip retains nineteen fractional texel-value bits
-              // before the two contributions are added. Fixed texel values
-              // and Q8 fractions keep these binary scales exact and normal.
-              filtered = (round_even(filtered * (1 - fraction) * 0x1p19) +
-                          round_even(filter_level(1) * fraction * 0x1p19)) *
-                         0x1p-19;
+              for (uint32_t filter_index = 1; filter_index < filter_count; ++filter_index)
+                filtered += weighted_filter(filter_index);
             } else {
-              // Do not multiply an unused mip's NaN/infinity by zero, or lose
-              // signed zero at an exact mip level.
-              if (fraction == 1)
-                filtered = filter_level(1);
-              else if (fraction != 0)
-                filtered = 0.0 + filtered * (1 - fraction) + filter_level(1) * fraction;
-              if (std::isnan(filtered))
-                filtered = kFilterNan;
+              ImageFilterAccumulator accumulator(filtered);
+              for (uint32_t filter_index = 1; filter_index < filter_count; ++filter_index)
+                accumulator.add(weighted_filter(filter_index));
+              filtered = accumulator.value;
+              accumulation_exponent = accumulator.exponent;
             }
-          }
-          return filtered;
-        };
-        double filtered;
-        int accumulation_exponent = 0;
-        if (filter_count > 1) {
-          const auto weighted_filter = [&](uint32_t index) {
-            const double value =
-                filter_sample(index) * image_anisotropic_filter_weight(filter_count, index);
-            // The UNORM accumulator normalizes after summation. Each weighted
-            // contribution retains nineteen fractional texel-value bits.
-            return fixed_unorm ? round_even(value * std::bit_floor(filter_count) * 0x1p19) * 0x1p-19
-                               : value;
-          };
-          filtered = weighted_filter(0);
-          if (fixed_unorm) {
-            for (uint32_t filter_index = 1; filter_index < filter_count; ++filter_index)
-              filtered += weighted_filter(filter_index);
           } else {
-            ImageFilterAccumulator accumulator(filtered);
-            for (uint32_t filter_index = 1; filter_index < filter_count; ++filter_index)
-              accumulator.add(weighted_filter(filter_index));
-            filtered = accumulator.value;
-            accumulation_exponent = accumulator.exponent;
+            filtered = filter_sample(0);
           }
-        } else {
-          filtered = filter_sample(0);
+          if (fixed_unorm) {
+            // Anisotropic accumulation rounds half up before normalization, then
+            // discards the normalization remainder. A single filter rounds even.
+            const uint64_t rounded_unorm =
+                filter_count > 1 ? static_cast<uint64_t>(std::floor(filtered * 0x1p13 + 0.5)) /
+                                       std::bit_floor(filter_count)
+                                 : static_cast<uint64_t>(round_even(filtered * 0x1p13));
+            values[c] = encode_filtered_unorm(rounded_unorm, unorm_width);
+            continue;
+          } else if (std::isfinite(filtered) && filtered != 0) {
+            const int exponent =
+                filter_count > 1 ? accumulation_exponent : 1 + std::ilogb(std::abs(filtered));
+            if (format.number == Number::Float && format.widths[0] == 32) {
+              // FP32 filtering retains 35 signed significant bits before the
+              // final rounding. Discarding signed low bits rounds downward.
+              const double scale = std::ldexp(1.0, 35 - exponent);
+              filtered = std::floor(filtered * scale) / scale;
+            }
+            // The floating-point filter rounds its result to 29 significant
+            // bits before conversion to FP32. This intermediate rounding can
+            // turn a value on either side of an FP32 midpoint into an exact tie.
+            const double scale = std::ldexp(1.0, 29 - exponent);
+            filtered = round_even(filtered * scale) / scale;
+          }
+          values[c] = std::bit_cast<uint32_t>(static_cast<float>(filtered));
+          // Sampling flushes FP32 underflow at the output as well as the input.
+          if (format.number == Number::Float && format.widths[0] == 32 &&
+              (values[c] & 0x7fffffffu) < 0x00800000u)
+            values[c] &= 0x80000000u;
         }
-        if (fixed_unorm) {
-          // Anisotropic accumulation rounds half up before normalization, then
-          // discards the normalization remainder. A single filter rounds even.
-          const uint64_t rounded_unorm =
-              filter_count > 1 ? static_cast<uint64_t>(std::floor(filtered * 0x1p13 + 0.5)) /
-                                     std::bit_floor(filter_count)
-                               : static_cast<uint64_t>(round_even(filtered * 0x1p13));
-          // Normalize by repeating eight- or ten-bit fields, then convert
-          // the 34 fractional bits to FP32 with midpoints rounded up. Packed
-          // two-bit alpha is expanded to ten bits before filtering as well.
-          const uint64_t numerator = rounded_unorm << (34 - 13 - unorm_width);
-          uint64_t normalized = 0;
-          for (uint32_t offset = 0; offset < 34; offset += unorm_width)
-            normalized += numerator >> offset;
-          const uint32_t bits = std::bit_width(normalized);
-          const uint32_t shift = bits > 24 ? bits - 24 : 0;
-          if (shift)
-            normalized = (normalized + (uint64_t{1} << (shift - 1))) >> shift;
-          // The rounded integer has at most 24 significant bits, or an exact
-          // power-of-two carry. Its nonzero scaled result is normal FP32.
-          // Encode that exact value without a general floating scaling call.
-          values[c] = 0;
-          if (normalized) {
-            const uint32_t leading = std::bit_width(normalized) - 1;
-            const uint32_t significand =
-                static_cast<uint32_t>((normalized << (63 - leading)) >> 40);
-            const uint32_t exponent = leading + shift + (127 - 34);
-            values[c] = (exponent << 23) | (significand & 0x7fffffu);
-          }
-          continue;
-        } else if (std::isfinite(filtered) && filtered != 0) {
-          const int exponent =
-              filter_count > 1 ? accumulation_exponent : 1 + std::ilogb(std::abs(filtered));
-          if (format.number == Number::Float && format.widths[0] == 32) {
-            // FP32 filtering retains 35 signed significant bits before the
-            // final rounding. Discarding signed low bits rounds downward.
-            const double scale = std::ldexp(1.0, 35 - exponent);
-            filtered = std::floor(filtered * scale) / scale;
-          }
-          // The floating-point filter rounds its result to 29 significant
-          // bits before conversion to FP32. This intermediate rounding can
-          // turn a value on either side of an FP32 midpoint into an exact tie.
-          const double scale = std::ldexp(1.0, 29 - exponent);
-          filtered = round_even(filtered * scale) / scale;
-        }
-        values[c] = std::bit_cast<uint32_t>(static_cast<float>(filtered));
-        // Sampling flushes FP32 underflow at the output as well as the input.
-        if (format.number == Number::Float && format.widths[0] == 32 &&
-            (values[c] & 0x7fffffffu) < 0x00800000u)
-          values[c] &= 0x80000000u;
       }
     }
     for (uint32_t reg = 0; reg < registers; ++reg) {
@@ -692,6 +767,7 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
       else
         cu.write_vgpr(d.dst_reg_base + reg, lane, packed);
     }
+    destinations_materialized = true;
   }
 }
 } // namespace rocjitsu::amdgpu

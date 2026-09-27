@@ -27,6 +27,7 @@ RJ_DIAGNOSTIC_POP
 #include "util/log.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -2285,10 +2286,20 @@ CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
     //     maybe_reset_lds_alloc() cannot reach it; release_wgp_workgroup() is the
     //     matching release (the same call notify_wg_complete uses on the normal path).
     // Without the WGP release a failed WGP dispatch would permanently pin that WGP.
-    std::vector<Wavefront *> wg_wavefronts;
-    wg_wavefronts.reserve(entry.wfs_per_workgroup);
+    // Most workgroups need at most 32 waves. Keep their temporary reservation
+    // list local, with dynamic storage for larger internal workgroups.
+    std::array<Wavefront *, 32> local_wavefronts;
+    std::vector<Wavefront *> large_wavefronts;
+    std::span<Wavefront *> wg_wavefronts;
+    if (entry.wfs_per_workgroup <= local_wavefronts.size()) {
+      wg_wavefronts = std::span(local_wavefronts).first(entry.wfs_per_workgroup);
+    } else {
+      large_wavefronts.resize(entry.wfs_per_workgroup);
+      wg_wavefronts = large_wavefronts;
+    }
+    uint32_t reserved_wavefronts = 0;
     const auto free_reserved = [&]() {
-      for (auto *claimed : wg_wavefronts)
+      for (auto *claimed : wg_wavefronts.first(reserved_wavefronts))
         cu->free_wavefront_resources(*claimed);
       if (entry.wgp_mode) {
         for (auto *spi : spis_)
@@ -2306,7 +2317,7 @@ CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
         free_reserved();
         return VmAccessOutcome::Malformed;
       }
-      wg_wavefronts.push_back(wf);
+      wg_wavefronts[reserved_wavefronts++] = wf;
     }
     for (uint32_t w = 0; w < entry.wfs_per_workgroup; ++w) {
       Wavefront *wf = wg_wavefronts[w];
@@ -2342,9 +2353,9 @@ CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
                         entry.num_named_barriers);
     register_cluster_workgroup(entry, local_wg_id, global_wg_id, cu, lds_base);
 
-    plugin_group_->onAmdgpuWorkgroupDispatched(
-        entry.dispatch_id, global_wg_id, cu->vgpr_allocation_block_size(),
-        cu->sgpr_allocation_block_size(), std::span<Wavefront *>(wg_wavefronts));
+    plugin_group_->onAmdgpuWorkgroupDispatched(entry.dispatch_id, global_wg_id,
+                                               cu->vgpr_allocation_block_size(),
+                                               cu->sgpr_allocation_block_size(), wg_wavefronts);
     for (auto *wf : wg_wavefronts)
       plugin_group_->onAmdgpuWavefrontDispatched(*wf);
 
@@ -3239,7 +3250,7 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
           plugin_group_->empty() &&
           std::ranges::none_of(cus_, [](const auto *cu) { return cu->debug_active(); });
       if (auto dp = state.draw->advance(*access, raster_pool, dispatch_threads_,
-                                        allow_ram_read_batching)) {
+                                        allow_ram_read_batching, allow_ram_read_batching)) {
         dispatch_graphics_pm4(queue, qs, std::move(*dp));
         return;
       }
@@ -3735,6 +3746,10 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
         if (submission.graphics_engine && event == 56) {
           // PIXEL_PIPE_STAT_CONTROL configures graphics counters, not a memory write.
           require(3);
+          // Mesa's ordinary preamble selects counter 0 and a 128-bit stride.
+          // Instance-enable bits do not mean an occlusion query is active.
+          state.unsupported_pixel_counter_mode =
+              words[0] != (56u | (1u << 8)) || (words[1] & 0x7ffu) != (2u << 9);
           break;
         }
         require(1);
@@ -3745,6 +3760,8 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
               (event == 15 || event == 16 || event == 36 || event == 38 || event == 44 ||
                event == 46 || event == 49)))
           throw std::runtime_error(std::format("unsupported PM4 EVENT_WRITE event {}", event));
+        if (event == 23 || event == 24)
+          state.performance_counters_active = event == 23;
         flush_gpu_caches();
         break;
       }

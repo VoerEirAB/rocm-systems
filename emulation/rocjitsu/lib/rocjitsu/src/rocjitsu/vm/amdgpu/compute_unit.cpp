@@ -763,16 +763,24 @@ bool ComputeUnitCore::can_accept_workgroup(uint32_t num_wfs, uint32_t lds_bytes,
     return false;
   }
 
-  // Count free wavefront slots.
+  // Unrestricted placement can reuse the resident count. Paused waves still
+  // occupy slots; scratch-limited placement must inspect the eligible prefix.
   uint32_t free_slots = 0;
-  const size_t slot_limit = scratch_wave_limit_per_se == UINT32_MAX
-                                ? wfs_.size()
-                                : std::min<size_t>(wfs_.size(), scratch_slots_per_cu_);
-  for (size_t slot = 0; slot < slot_limit && free_slots < num_wfs; ++slot) {
-    const uint64_t scratch_scoreboard_id = static_cast<uint64_t>(scratch_scoreboard_base_) + slot;
-    if (scratch_scoreboard_id < scratch_wave_limit_per_se &&
-        (!wfs_[slot] || wfs_[slot]->is_halted()))
-      ++free_slots;
+  if (scratch_wave_limit_per_se == UINT32_MAX &&
+      uint64_t{scratch_scoreboard_base_} + wfs_.size() <= UINT32_MAX) {
+    const uint32_t active = static_cast<uint32_t>(wave_activity_.load(std::memory_order_acquire));
+    assert(active <= wfs_.size());
+    free_slots = static_cast<uint32_t>(wfs_.size()) - active;
+  } else {
+    const size_t slot_limit = scratch_wave_limit_per_se == UINT32_MAX
+                                  ? wfs_.size()
+                                  : std::min<size_t>(wfs_.size(), scratch_slots_per_cu_);
+    for (size_t slot = 0; slot < slot_limit && free_slots < num_wfs; ++slot) {
+      const uint64_t scratch_scoreboard_id = static_cast<uint64_t>(scratch_scoreboard_base_) + slot;
+      if (scratch_scoreboard_id < scratch_wave_limit_per_se &&
+          (!wfs_[slot] || wfs_[slot]->is_halted()))
+        ++free_slots;
+    }
   }
   if (free_slots < num_wfs) {
     util::Logger::vm("CU ", this->name(), " can_accept_wg: REJECT free_slots=", free_slots,
@@ -2008,6 +2016,12 @@ template <bool EnableAsync>
   WaveStateGuard wave_state_lock(*this);
   tick_pipelines();
   update_wf_states();
+  const bool metadata_batch =
+      !EnableAsync &&
+      (config_.arch == ROCJITSU_CODE_ARCH_RDNA3 || config_.arch == ROCJITSU_CODE_ARCH_RDNA3_5) &&
+      pool_driven() && !debug_active() && plugin_group().empty() &&
+      static_cast<uint32_t>(wave_activity_.load(std::memory_order_acquire)) > 1;
+  GlobalMemPipeline::StepBatch step_batch(global_mem_pipeline_, metadata_batch);
 
   for (auto &wf : wfs_) {
     if (!wf)
@@ -2038,6 +2052,7 @@ template <bool EnableAsync>
     }
   }
 
+  step_batch.finish();
   ++step_count_;
   if constexpr (util::Logger::group_enabled(util::Logger::GROUP_CP)) {
     if ((step_count_ & 0xFFFFF) == 0) {

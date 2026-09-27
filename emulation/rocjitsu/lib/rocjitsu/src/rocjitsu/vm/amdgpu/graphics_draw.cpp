@@ -19,11 +19,19 @@
 #include <cerrno>
 #include <cfenv>
 #include <cmath>
+#include <cstddef>
+#include <cstring>
 #include <format>
 #include <stdexcept>
+#include <type_traits>
 
 namespace rocjitsu::amdgpu {
 namespace {
+struct RestoreErrno {
+  int value = errno;
+  ~RestoreErrno() { errno = value; }
+};
+
 constexpr uint32_t kTriangleList = 4, kTriangleStrip = 6, kRectangleList = 17;
 
 std::array<uint32_t, 3> strip_vertex_offsets(bool reverse, bool last_provoking) {
@@ -442,6 +450,41 @@ GraphicsDraw::GraphicsDraw(const Pm4QueueState &state, rj_code_arch_t arch, uint
        primitive_type_ != kRectangleList))
     throw std::runtime_error("unsupported graphics primitive, vertex count, or instance count");
   const auto &ctx = state.context_registers;
+  const bool gfx12 = arch == ROCJITSU_CODE_ARCH_RDNA4;
+  const uint32_t shader_control = ctx[gfx12 ? 0x1b : 0x203];
+  // RADV programs early/late Z and clears both EXEC preservation bits only
+  // when an implicit early test may omit the shader. Explicit early tests,
+  // discard, depth/coverage exports and ordered shaders keep the original path.
+  // EARLY_Z_THEN_LATE_Z, ALPHA_TO_MASK_DISABLE and DUAL_QUAD_DISABLE.
+  constexpr uint32_t allowed_shader_control = (1u << 4) | (1u << 11) | (1u << 15);
+  const uint32_t aa_control = ctx[0x2f8];
+  // PA_SC_AA_CONFIG: sample count, exposed samples, detail-to-exposed mode,
+  // then GFX12 sample iteration or GFX11 coverage selection/encoding.
+  const uint32_t sample_modes = 7u | (7u << 20) | (3u << 24) | (gfx12 ? 3u << 30 : 7u << 26);
+  // GFX12 RADV requests stencil reads even with the effective stencil test
+  // disabled. GFX11 instead uses this register for viewport-clamp control.
+  const uint32_t allowed_override = gfx12 ? 1u << 12 : 1u << 16;
+  // DB_RENDER_CONTROL: compression-disable hints and maximum wave tile count.
+  constexpr uint32_t allowed_render_control = (3u << 5) | (15u << 20);
+  // DB_EQAA: sample counts and over-rasterization, including post-Z coverage.
+  constexpr uint32_t eqaa_coverage = 0x7777u | (15u << 24);
+  // Conservative rasterization: over/under enable and coverage/pre/post-Z masks.
+  // Bit20 (NULL_SQUAD_AA_MASK_ENABLE) is RADV's ordinary disabled-mode value.
+  constexpr uint32_t conservative_coverage = (1u << 0) | (1u << 5) | (7u << 21);
+  // DB_RENDER_OVERRIDE2: validation/decompression and hierarchical comparisons.
+  constexpr uint32_t override_comparisons = (3u << 7) | (0x3ffu << 11);
+  // Pipeline statistics count actual invocations; enabling them does not forbid
+  // the early omission permitted by the shader state below.
+  early_depth_state_ =
+      (shader_control & ~allowed_shader_control) == 0 && (shader_control & (1u << 4)) &&
+      !state.performance_counters_active && !state.unsupported_pixel_counter_mode &&
+      ctx[gfx12 ? 0x18 : 1] == 0 &&      // DB_COUNT_CONTROL
+      ctx[gfx12 ? 0x194 : 0x1c4] == 0 && // SPI_SHADER_Z_FORMAT
+      !(aa_control & sample_modes) && !(ctx[gfx12 ? 0x1e : 0x201] & eqaa_coverage) &&
+      !(ctx[0x293] & (1u << 16)) && // PA_SC_MODE_CNTL_1.PS_ITER_SAMPLE
+      !(ctx[gfx12 ? 0x315 : 0x313] & conservative_coverage) &&
+      !(ctx[0] & ~allowed_render_control) && !(ctx[3] & ~allowed_override) &&
+      !(ctx[4] & override_comparisons);
   for (uint32_t target = 0; target < colors_.size(); ++target) {
     auto &color = colors_[target];
     const uint32_t dst = 0x318 + 9 * target;
@@ -640,11 +683,20 @@ bool GraphicsDraw::enable_vertex_batching(const GpuVmAccess &memory, uint32_t li
       return false;
     return disjoint(begin, end - begin);
   };
+  const auto disjoint_metadata = [&](uint64_t base, uint32_t width, uint32_t height, uint32_t bytes,
+                                     bool depth, bool pipe_aligned, uint32_t first, uint32_t last) {
+    const auto range =
+        gfx11_metadata_range(base, width, height, bytes, depth, pipe_aligned, first, last);
+    return range && disjoint(range->address, range->size);
+  };
   for (const auto &color : colors_) {
-    if (color.write_mask && (color.max_mip ||
-                             !disjoint_surface(color.base, color.slice_size, color.first_layer,
-                                               color.last_layer, color.swizzle) ||
-                             (color.metadata && !disjoint_allocation(*color.metadata))))
+    if (color.write_mask &&
+        (color.max_mip ||
+         !disjoint_surface(color.base, color.slice_size, color.first_layer, color.last_layer,
+                           color.swizzle) ||
+         (color.metadata &&
+          !disjoint_metadata(*color.metadata, color.width, color.height, color.bytes, false,
+                             color.pipe_aligned, color.first_layer, color.last_layer))))
       return false;
   }
   if ((depth_control_ & 3) && ((context_[6] >> 15) & 31))
@@ -656,7 +708,9 @@ bool GraphicsDraw::enable_vertex_batching(const GpuVmAccess &memory, uint32_t li
       !disjoint_surface(stencil_base_, stencil_slice_size_, depth_first_layer_, depth_last_layer_,
                         stencil_swizzle_))
     return false;
-  if (depth_metadata_ && !disjoint_allocation(*depth_metadata_))
+  if (depth_metadata_ &&
+      !disjoint_metadata(*depth_metadata_, depth_width_, depth_height_, depth_bytes_, true, true,
+                         depth_first_layer_, depth_last_layer_))
     return false;
   vertex_group_limit_ = limit;
   attribute_slot_bytes_ = slot_bytes;
@@ -695,6 +749,8 @@ std::optional<DispatchEntry> GraphicsDraw::next_vertex_group() {
     return std::nullopt;
   select_vertex_groups();
   fragments_.clear();
+  fragment_exports_.clear();
+  fragment_exports_prepared_ = false;
   fragment_stage_ = false;
   return vertex_dispatch();
 }
@@ -727,7 +783,7 @@ DispatchEntry GraphicsDraw::vertex_dispatch() const {
 
 void GraphicsDraw::initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave_index) {
   if (fragment_stage_) {
-    auto &batch = fragments_.at(wave.wg_coord()[0]);
+    auto &batch = fragment_for_dispatch(wave.wg_coord()[0]);
     const uint32_t users = ((sh_[0xb] >> 1) & 31) | ((sh_[0xb] >> 22) & 32);
     for (uint32_t i = 0; i < users; ++i)
       wave.debug_write_sgpr(i, sh_[0xc + i]);
@@ -752,6 +808,24 @@ void GraphicsDraw::initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave
       else
         wave.debug_write_vgpr(reg, lane, value);
     };
+    // Decode the lane-invariant barycentric input selection once. The plan
+    // contains only byte offsets; register storage is still acquired at the
+    // original first write, before the unchanged position arithmetic.
+    constexpr uint8_t source_offsets[7][3] = {
+        {offsetof(Fragment, i), offsetof(Fragment, j)},
+        {offsetof(Fragment, i), offsetof(Fragment, j)},
+        {offsetof(Fragment, i), offsetof(Fragment, j)},
+        {offsetof(Fragment, pull_model), offsetof(Fragment, pull_model) + sizeof(float),
+         offsetof(Fragment, pull_model) + 2 * sizeof(float)},
+        {offsetof(Fragment, linear_i), offsetof(Fragment, linear_j)},
+        {offsetof(Fragment, linear_i), offsetof(Fragment, linear_j)},
+        {offsetof(Fragment, linear_i), offsetof(Fragment, linear_j)}};
+    std::array<uint8_t, 15> input_offsets;
+    uint32_t input_count = 0;
+    for (uint32_t input = 0; input < 7; ++input)
+      if (context_[0x198] & (1u << input))
+        for (uint32_t component = 0; component < (input == 3 ? 3u : 2u); ++component)
+          input_offsets[input_count++] = source_offsets[input][component];
     uint64_t exec = 0;
     for (uint32_t lane = 0; lane < wave.wf_size(); ++lane) {
       const auto &f = batch.lanes[lane];
@@ -761,20 +835,11 @@ void GraphicsDraw::initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave
       const auto put = [&](float value) {
         write_input(vgpr++, lane, std::bit_cast<uint32_t>(value));
       };
-      for (uint32_t input = 0; input < 7; ++input) {
-        if (!(context_[0x198] & (1u << input)))
-          continue;
-        if (input == 3) {
-          for (float value : f.pull_model)
-            put(value);
-        } else if (input < 3) {
-          // With one sample, center, sample and covered centroid coincide.
-          put(f.i);
-          put(f.j);
-        } else {
-          put(f.linear_i);
-          put(f.linear_j);
-        }
+      for (uint32_t input = 0; input < input_count; ++input) {
+        uint32_t value;
+        std::memcpy(&value, reinterpret_cast<const std::byte *>(&f) + input_offsets[input],
+                    sizeof(value));
+        write_input(vgpr++, lane, value);
       }
       // POS_W_FLOAT supplies W; PERSP_PULL_MODEL above supplies 1/W.
       const std::array<float, 4> position{float(f.x) + 0.5f, float(f.y) + 0.5f, f.z,
@@ -837,7 +902,7 @@ void GraphicsDraw::initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave
 void GraphicsDraw::export_mask(Wavefront &wave, uint64_t mask) {
   if (!fragment_stage_)
     return;
-  auto &batch = fragments_.at(wave.wg_coord()[0]);
+  auto &batch = fragment_for_dispatch(wave.wg_coord()[0]);
   for (uint32_t lane = 0; lane < fragment_wave_size_; ++lane)
     batch.lanes[lane].covered &= (mask & (uint64_t{1} << lane)) != 0;
 }
@@ -847,14 +912,22 @@ void GraphicsDraw::export_lane(Wavefront &wave, uint32_t lane, uint32_t target, 
   if (fragment_stage_) {
     if (target == 8 && !(mask & ~1u)) {
       if (mask)
-        fragments_.at(wave.wg_coord()[0]).lanes[lane].z = std::bit_cast<float>(values[0]);
+        fragment_for_dispatch(wave.wg_coord()[0]).lanes[lane].z = std::bit_cast<float>(values[0]);
       return;
     }
     if (target >= colors_.size()) {
       wave.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
       return;
     }
-    auto &exported = fragments_.at(wave.wg_coord()[0]).lanes[lane].exports[target];
+    auto &batch = fragment_for_dispatch(wave.wg_coord()[0]);
+    assert(fragment_exports_prepared_);
+    const uint32_t slot = export_slots_[target];
+    // Valid exports unused by every attachment have no output consumer. Keep
+    // operand validation/reads and coverage updates in export_graphics unchanged.
+    if (slot == kColorTargets)
+      return;
+    assert(batch.export_offset != size_t(-1));
+    auto &exported = fragment_exports_[batch.export_offset + slot * 64 + lane];
     for (uint32_t i = 0; i < 4; ++i)
       if (mask & (1u << i))
         exported.values[i] = values[i];
@@ -896,6 +969,186 @@ void GraphicsDraw::finish_vertices(const VertexGroup &group) {
   }
 }
 
+GraphicsDraw::FragmentWave &GraphicsDraw::fragment_for_dispatch(uint32_t workgroup) {
+  return fragments_.at(fragment_selection_active_ ? fragment_dispatch_indices_.at(workgroup)
+                                                  : workgroup);
+}
+
+bool GraphicsDraw::select_fragment_waves(const GpuVmAccess &memory) {
+  const uint32_t comparison = (depth_control_ >> 4) & 7;
+  if (!early_depth_state_ || fragments_.empty() || (depth_control_ & 3) != 2 ||
+      (depth_control_ & 8) || depth_bytes_ != 4 || depth_first_layer_ != depth_last_layer_ ||
+      (comparison != 1 && comparison != 3 && comparison != 4 && comparison != 6))
+    return false;
+  const ColorAttachment *color = nullptr;
+  for (const auto &attachment : colors_) {
+    if (!attachment.write_mask)
+      continue;
+    if (color || attachment.first_layer != attachment.last_layer)
+      return false;
+    color = &attachment;
+  }
+  // Only integer operations are used in the extra predicate. Normal finite
+  // values and signed zero compare independently of host rounding/DAZ/FTZ.
+  const auto supported_depth = [](uint32_t bits) {
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    return magnitude < 0x7f800000u && (!magnitude || magnitude >= 0x00800000u);
+  };
+  const auto ordered_depth = [](uint32_t bits) {
+    if (!(bits & 0x7fffffffu))
+      bits = 0;
+    return bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+  };
+  const bool clamp = !(context_[0x19] & 1);
+  const uint32_t minimum = context_[0x115], maximum = context_[0x116];
+  if (clamp && (!supported_depth(minimum) || !supported_depth(maximum) ||
+                ordered_depth(minimum) > ordered_depth(maximum)))
+    return false;
+  RestoreErrno restore_errno;
+  const bool gfx12 = arch_ == ROCJITSU_CODE_ARCH_RDNA4;
+  const auto image_address = gfx12 ? gfx12_image_address : gfx11_image_address;
+  struct Surface {
+    uint64_t base;
+    uint32_t bytes, swizzle, pitch, tail_x, tail_y, width, height;
+    uint64_t begin = UINT64_MAX, end = 0;
+  };
+  std::array<Surface, 2> surfaces{};
+  surfaces[0] = {image_layer_base(gfx12, depth_base_, depth_slice_size_, depth_first_layer_, 4,
+                                  depth_swizzle_),
+                 4,
+                 depth_swizzle_,
+                 depth_pitch_,
+                 depth_tail_x_,
+                 depth_tail_y_,
+                 depth_width_,
+                 depth_height_};
+  const uint32_t surface_count = color ? 2 : 1;
+  if (color)
+    surfaces[1] = {image_layer_base(gfx12, color->base, color->slice_size, color->first_layer,
+                                    color->bytes, color->swizzle),
+                   color->bytes,
+                   color->swizzle,
+                   color->pitch,
+                   color->tail_x,
+                   color->tail_y,
+                   color->width,
+                   color->height};
+  // Include every possible color write, before the shader has produced exports.
+  // A color alias could otherwise invalidate monotone depth rejection.
+  for (const auto &batch : fragments_) {
+    if (batch.relative_layer)
+      return false;
+    for (uint32_t lane = 0; lane < fragment_wave_size_; ++lane) {
+      const auto &fragment = batch.lanes[lane];
+      if (!fragment.covered)
+        continue;
+      if (!supported_depth(std::bit_cast<uint32_t>(fragment.z)))
+        return false;
+      for (auto &surface : std::span{surfaces}.first(surface_count)) {
+        if (fragment.x < 0 || fragment.y < 0 || uint32_t(fragment.x) >= surface.width ||
+            uint32_t(fragment.y) >= surface.height)
+          return false;
+        const auto address =
+            image_address(surface.base, fragment.x + surface.tail_x, fragment.y + surface.tail_y,
+                          surface.pitch, surface.bytes, surface.swizzle);
+        if (!address || *address > UINT64_MAX - surface.bytes)
+          return false;
+        surface.begin = std::min(surface.begin, *address);
+        surface.end = std::max(surface.end, *address + surface.bytes);
+      }
+    }
+  }
+  std::array<VmRamRange, 2> ranges{};
+  for (uint32_t i = 0; i < surface_count; ++i) {
+    if (surfaces[i].begin >= surfaces[i].end)
+      return false;
+    ranges[i] = {surfaces[i].begin, surfaces[i].end - surfaces[i].begin};
+  }
+  std::vector<uint32_t> indices(fragments_.size());
+  auto lease = memory.try_lease_ram(std::span{ranges}.first(surface_count));
+  if (!lease)
+    return false;
+  // Admission proves strict private RAM and disjoint underlying attachment
+  // bytes. It pins mappings, not values. Same-draw LESS/LEQUAL writes only lower
+  // depth; GREATER/GEQUAL writes only raise it. A failed test stays failed.
+  // Shader memory writes, depth exports, feedback and stencil were excluded by
+  // the programmed early-Z contract. No pointers survive this inspection.
+  const auto depth_bytes = lease->bytes(0);
+  uint32_t survivors = 0;
+  for (uint32_t wave = 0; wave < fragments_.size(); ++wave) {
+    bool rejected = true;
+    for (uint32_t lane = 0; lane < fragment_wave_size_; ++lane) {
+      const auto &fragment = fragments_[wave].lanes[lane];
+      if (!fragment.covered)
+        continue;
+      const auto &depth = surfaces[0];
+      const auto address = image_address(depth.base, fragment.x + depth.tail_x,
+                                         fragment.y + depth.tail_y, depth.pitch, 4, depth.swizzle);
+      uint32_t previous;
+      std::memcpy(&previous, depth_bytes.data() + (*address - depth.begin), sizeof(previous));
+      if (!supported_depth(previous)) {
+        rejected = false;
+        break;
+      }
+      uint32_t incoming = std::bit_cast<uint32_t>(fragment.z);
+      if (clamp) {
+        if (ordered_depth(incoming) < ordered_depth(minimum))
+          incoming = minimum;
+        else if (ordered_depth(incoming) > ordered_depth(maximum))
+          incoming = maximum;
+      }
+      if (depth_stencil_compare(comparison, ordered_depth(incoming), ordered_depth(previous))) {
+        rejected = false;
+        break;
+      }
+    }
+    if (!rejected)
+      indices[survivors++] = wave;
+  }
+  lease.reset();
+  if (survivors == fragments_.size())
+    return false;
+  indices.resize(survivors);
+  fragment_dispatch_indices_.swap(indices);
+  fragment_selection_active_ = true;
+  return true;
+}
+
+const GraphicsDraw::ColorExport &
+GraphicsDraw::fragment_export(const FragmentWave &batch, uint32_t lane, uint32_t target) const {
+  static constexpr ColorExport absent{};
+  if (!fragment_exports_prepared_ || batch.export_offset == size_t(-1) ||
+      export_slots_[target] == kColorTargets)
+    return absent;
+  return fragment_exports_[batch.export_offset + export_slots_[target] * 64 + lane];
+}
+
+void GraphicsDraw::prepare_fragment_exports() {
+  if (fragment_exports_prepared_)
+    return;
+  std::array<uint8_t, kColorTargets> slots;
+  slots.fill(kColorTargets);
+  uint32_t count = 0;
+  for (const auto &color : colors_)
+    if (color.write_mask && slots[color.export_index] == kColorTargets)
+      slots[color.export_index] = static_cast<uint8_t>(count++);
+  const size_t stride = 64 * count;
+  const size_t waves =
+      fragment_selection_active_ ? fragment_dispatch_indices_.size() : fragments_.size();
+  if (stride && waves > fragment_exports_.max_size() / stride)
+    throw std::length_error("fragment color export storage exceeds host capacity");
+  // The prior window is retired before clearing, and every new record starts
+  // at zero. Allocation occurs before FS callbacks and outside any RAM lease.
+  assert(fragment_exports_.empty());
+  fragment_exports_.resize(waves * stride);
+  export_slots_ = slots;
+  for (size_t wave = 0; wave < waves && stride; ++wave) {
+    const size_t index = fragment_selection_active_ ? fragment_dispatch_indices_[wave] : wave;
+    fragments_[index].export_offset = wave * stride;
+  }
+  fragment_exports_prepared_ = true;
+}
+
 DispatchEntry GraphicsDraw::fragment_dispatch() const {
   DispatchEntry dp;
   const uint32_t rsrc1 = sh_[0xa];
@@ -907,7 +1160,8 @@ DispatchEntry GraphicsDraw::fragment_dispatch() const {
   if (rsrc1 & (1u << 29))
     dp.initial_mode_raw |= Wavefront::FP16_OVFL_BIT;
   dp.group_segment_fixed_size = 2048;
-  dp.total_wgs = dp.grid_wgs_x = fragments_.size();
+  dp.total_wgs = dp.grid_wgs_x =
+      fragment_selection_active_ ? fragment_dispatch_indices_.size() : fragments_.size();
   dp.grid_wgs_y = dp.grid_wgs_z = 1;
   dp.grid_yz_valid = true;
   dp.workgroup_size_x = dp.kernel_wave_size;
@@ -1117,10 +1371,7 @@ bool GraphicsDraw::try_gather_attributes(const GpuVmAccess &memory, const Vertex
 #if defined(__GLIBC__) && defined(__x86_64__)
   if (!attribute_ram_candidate_ || !memory.supports_ram_word_reads())
     return false;
-  struct RestoreErrno {
-    int value = errno;
-    ~RestoreErrno() { errno = value; }
-  } restore_errno;
+  RestoreErrno restore_errno;
   // The original parameter allocation has already happened. Reordering reads
   // ahead of coefficient math is allowed only without host exception traps.
   std::fenv_t environment;
@@ -1569,6 +1820,21 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
         }
       }
       const auto coverage_mask = [&](int x, int y) {
+        const auto inside_edges = [&](std::span<const Point> points, double signed_area, double px,
+                                      double py) {
+          if (signed_area == 0)
+            return false;
+          bool inside = true;
+          for (uint32_t k = 0; k < points.size(); ++k) {
+            Point a = points[k], b = points[(k + 1) % points.size()];
+            if (signed_area < 0)
+              std::swap(a, b);
+            const double e = edge(a, b, px, py);
+            const bool top_left = b.y < a.y || (b.y == a.y && b.x > a.x);
+            inside &= e > 0 || (e == 0 && top_left);
+          }
+          return inside;
+        };
         uint8_t mask = 0;
         for (int q = 0; q < 4; ++q) {
           const int fx = x + (q & 1), fy = y + (q >> 1);
@@ -1579,14 +1845,19 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
                      px < std::max({v[0].x, v[1].x, v[2].x}) &&
                      py >= std::min({v[0].y, v[1].y, v[2].y}) &&
                      py < std::max({v[0].y, v[1].y, v[2].y});
+          } else if (coverage.size() == 3) {
+            inside = inside_edges(coverage, area, px, py);
           } else {
-            for (uint32_t k = 0; k < coverage.size(); ++k) {
-              Point a = coverage[k], b = coverage[(k + 1) % coverage.size()];
-              if (area < 0)
-                std::swap(a, b);
-              const double e = edge(a, b, px, py);
-              const bool top_left = b.y < a.y || (b.y == a.y && b.x > a.x);
-              inside &= e > 0 || (e == 0 && top_left);
+            // Depth clipping precedes snapping, which can make the resulting
+            // polygon nonconvex or reverse one fan triangle's winding. Union
+            // triangle coverage while retaining the primitive's facing and
+            // original interpolation planes. Emit each sample only once.
+            inside = false;
+            for (uint32_t k = 1; k + 1 < coverage.size(); ++k) {
+              const std::array triangle{coverage[0], coverage[k], coverage[k + 1]};
+              const double triangle_area =
+                  edge(triangle[0], triangle[1], triangle[2].x, triangle[2].y);
+              inside |= inside_edges(triangle, triangle_area, px, py);
             }
           }
           const bool sample_enabled = (context_[0x30e + (fy & 1)] >> (16 * (fx & 1))) & 1;
@@ -1595,24 +1866,45 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
         }
         return mask;
       };
-      const auto interpolate_quad = [&](Fragment *quad, int x, int y, uint8_t mask) {
+      const bool use_sse41_planes = raster::supports_sse41_planes();
+      const bool omit_unused_linear =
+          allow_ram_read_batching && !(context_[0x198] & 0x70) &&
+          raster::can_omit_bounded_planes(plane_i, plane_j, screen[0].x, screen[0].y);
+      const auto interpolate_quad_impl = [&]<bool Sse41>(Fragment *quad, int x, int y,
+                                                         uint8_t mask) {
         for (int q = 0; q < 4; ++q) {
           auto &f = quad[q];
           f.x = x + (q & 1);
           f.y = y + (q >> 1);
           f.covered = mask & (1u << q);
           const double dx = x + 0.5 - screen[0].x, dy = y + 0.5 - screen[0].y;
-          const double b1 = plane_i.at_quad(dx, dy, q);
-          const double b2 = plane_j.at_quad(dx, dy, q);
-          f.linear_i = b1;
-          f.linear_j = b2;
-          f.pull_model = {plane_iw.at_quad(dx, dy, q), plane_jw.at_quad(dx, dy, q),
-                          plane_rw.at_quad(dx, dy, q)};
+          const auto evaluate = [&](const raster::Plane &plane) {
+#if defined(__clang__) && defined(__x86_64__)
+            if constexpr (Sse41)
+              return plane.at_quad_sse41(dx, dy, q);
+#endif
+            return plane.at_quad(dx, dy, q);
+          };
+          if (omit_unused_linear) {
+            f.linear_i = 0;
+            f.linear_j = 0;
+          } else {
+            const double b1 = evaluate(plane_i);
+            const double b2 = evaluate(plane_j);
+            f.linear_i = b1;
+            f.linear_j = b2;
+          }
+          f.pull_model = {evaluate(plane_iw), evaluate(plane_jw), evaluate(plane_rw)};
           const float w = raster::reciprocal(f.pull_model[2]);
           f.i = raster::multiply_perspective(f.pull_model[0], w);
           f.j = raster::multiply_perspective(f.pull_model[1], w);
           f.z = plane_z.at(f.x, f.y);
         }
+      };
+      const auto interpolate_quad = [&](Fragment *quad, int x, int y, uint8_t mask) {
+        if (use_sse41_planes)
+          return interpolate_quad_impl.template operator()<true>(quad, x, y, mask);
+        interpolate_quad_impl.template operator()<false>(quad, x, y, mask);
       };
       const auto parallel_raster = [&]() {
 #if defined(__GLIBC__) && defined(__x86_64__)
@@ -1677,8 +1969,32 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
         for (uint32_t stripe = 0; stripe < stripe_count; ++stripe)
           offsets[stripe + 1] = offsets[stripe] + counts[stripe];
         const uint32_t quads_per_wave = fragment_wave_size_ / 4;
+        static_assert(std::is_trivially_default_constructible_v<Fragment>);
+        static_assert(std::is_nothrow_move_constructible_v<FragmentWave>);
         const size_t first_wave = fragments_.size();
-        fragments_.resize(first_wave + (offsets.back() + quads_per_wave - 1) / quads_per_wave);
+        const size_t wave_count = (offsets.back() + quads_per_wave - 1) / quads_per_wave;
+        const size_t available = fragments_.max_size() - first_wave;
+        if (wave_count > available)
+          throw std::length_error("graphics fragment count exceeds capacity");
+        // Grow before constructing any unfinished lanes. Keep geometric growth
+        // when several primitives append to the same fragment window.
+        if (first_wave + wave_count > fragments_.capacity())
+          fragments_.reserve(first_wave + std::min(available, std::max(first_wave, wave_count)));
+        struct InitializeOnFailure {
+          std::vector<FragmentWave> &waves;
+          size_t first;
+          bool complete = false;
+          ~InitializeOnFailure() {
+            if (!complete)
+              for (size_t wave = first; wave < waves.size(); ++wave)
+                waves[wave].lanes.fill(Fragment{});
+          }
+        } initialize_on_failure{fragments_, first_wave};
+        for (size_t wave = 0; wave < wave_count; ++wave) {
+          const uint32_t live_lanes =
+              4 * std::min<size_t>(quads_per_wave, offsets.back() - wave * quads_per_wave);
+          fragments_.emplace_back(FragmentWave::InterpolatedLanes{}, live_lanes);
+        }
         for (size_t wave = first_wave; wave < fragments_.size(); ++wave) {
           auto &batch = fragments_[wave];
           batch.relative_layer = relative_layer;
@@ -1689,26 +2005,31 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
           in_environment(stripe, [&] {
             size_t output = offsets[stripe];
             auto &result = results[stripe];
+            std::array<Fragment, 4> discarded_quad;
             for (uint32_t row = rows * stripe / stripe_count;
                  row < rows * (stripe + 1) / stripe_count; ++row) {
               const int y = (min_y & ~1) + 2 * row;
               for (uint32_t column = 0; column < columns; ++column) {
                 const size_t index = size_t{row} * columns + column;
-                if (!masks[index])
-                  continue;
-                auto &batch = fragments_[first_wave + output / quads_per_wave];
+                Fragment *quad = discarded_quad.data();
+                if (masks[index])
+                  quad = fragments_[first_wave + output / quads_per_wave].lanes.data() +
+                         (output % quads_per_wave) * 4;
                 errno = 0;
-                interpolate_quad(batch.lanes.data() + (output % quads_per_wave) * 4,
-                                 (min_x & ~1) + 2 * column, y, masks[index]);
+                interpolate_quad(quad, (min_x & ~1) + 2 * column, y, masks[index]);
+                // Keep uncovered interpolation live for FP exceptions and errno.
+                if (!masks[index])
+                  asm volatile("" : : "m"(discarded_quad));
                 if (errno) {
                   result.error = errno;
                   result.error_index = index;
                 }
-                ++output;
+                output += masks[index] != 0;
               }
             }
           });
         });
+        initialize_on_failure.complete = true;
         // Join before the next primitive's attribute accesses or metadata work.
         // This preserves callback-visible caller flags and all worker FP state.
         size_t error_index = 0;
@@ -1742,8 +2063,13 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       for (int y = min_y & ~1; y < max_y; y += 2) {
         for (int x = min_x & ~1; x < max_x; x += 2) {
           const uint8_t mask = coverage_mask(x, y);
-          if (!mask)
+          if (!mask) {
+            std::array<Fragment, 4> discarded_quad;
+            interpolate_quad(discarded_quad.data(), x, y, mask);
+            // Keep uncovered interpolation live for FP exceptions and errno.
+            asm volatile("" : : "m"(discarded_quad));
             continue;
+          }
           interpolate_quad(batch.lanes.data() + used, x, y, mask);
           used += 4;
           if (used == fragment_wave_size_) {
@@ -1773,12 +2099,22 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       const uint32_t block_bits = 8 - std::countr_zero(color.bytes);
       const uint32_t block_width = 1u << ((block_bits + 1) / 2);
       const uint32_t block_height = 1u << (block_bits / 2);
-      for (uint32_t layer = color.first_layer; layer <= color.last_layer; ++layer)
+      for (uint32_t layer = color.first_layer; layer <= color.last_layer; ++layer) {
+        if (allow_ram_read_batching &&
+            try_gfx11_expanded_dcc(memory, *color.metadata, color.width, color.height, color.bytes,
+                                   color.swizzle, color.pipe_aligned, layer))
+          continue;
+        if (allow_ram_read_batching &&
+            try_materialize_gfx11_dcc_layer(memory, color.base, *color.metadata, color.width,
+                                            color.height, color.bytes, color.swizzle,
+                                            color.pipe_aligned, layer, color.slice_size))
+          continue;
         for (uint32_t y = 0; y < color.height; y += block_height)
           for (uint32_t x = 0; x < color.width; x += block_width)
             materialize_gfx11_dcc(memory, color.base, *color.metadata, x, y, color.width,
                                   color.height, color.bytes, color.swizzle, color.pipe_aligned,
                                   layer, color.slice_size);
+      }
     }
     if ((depth_control_ & 2) && depth_metadata_) {
       uint32_t bits = depth_clear_;
@@ -1790,7 +2126,12 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       const bool expanded = allow_ram_read_batching && depth_bytes_ == 4 && !(depth_control_ & 1) &&
                             try_gfx11_expanded_htile(memory, *depth_metadata_, depth_width_,
                                                      depth_height_, depth_swizzle_);
-      if (!expanded)
+      const bool materialized =
+          !expanded && allow_ram_read_batching && depth_bytes_ == 4 && !(depth_control_ & 1) &&
+          try_materialize_gfx11_htile_layer(memory, depth_base_, *depth_metadata_, depth_width_,
+                                            depth_height_, depth_swizzle_, bits,
+                                            depth_metadata_has_stencil_);
+      if (!expanded && !materialized)
         for (uint32_t y = 0; y < depth_height_; y += 8)
           for (uint32_t x = 0; x < depth_width_; x += 8)
             materialize_gfx11_htile(memory, depth_base_, *depth_metadata_, x, y, depth_width_,
@@ -1915,7 +2256,7 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
     const auto &color = colors_[target];
     if (!color.write_mask)
       continue;
-    const auto &exported = f.exports[color.export_index];
+    const auto &exported = fragment_export(batch, lane, color.export_index);
     if (!exported.mask || batch.relative_layer > color.last_layer - color.first_layer)
       continue;
     auto [component_mask, components] = decode_export(color.export_format, exported);
@@ -2044,7 +2385,7 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
         copy_source = true;
         for (uint32_t neighbor = lane & ~3u; neighbor < (lane & ~3u) + 4; ++neighbor) {
           const auto &fragment = batch.lanes[neighbor];
-          const auto &other = fragment.exports[color.export_index];
+          const auto &other = fragment_export(batch, neighbor, color.export_index);
           if (!fragment.covered || !other.mask)
             continue;
           const auto decoded_neighbor = decode_export(color.export_format, other);
@@ -2201,7 +2542,7 @@ bool GraphicsDraw::try_parallel_outputs(const GpuVmAccess &memory, CpuDispatchPo
         continue;
       bool color_export = false;
       if (color) {
-        const auto &exported = fragment.exports[color->export_index];
+        const auto &exported = fragment_export(batch, lane, color->export_index);
         // Refuse before any effect; the serial path reports an invalid export at
         // its original position, after any earlier pixels have committed.
         if (exported.mask & ~export_mask)
@@ -2337,27 +2678,41 @@ bool GraphicsDraw::try_parallel_outputs(const GpuVmAccess &memory, CpuDispatchPo
 }
 
 std::optional<DispatchEntry> GraphicsDraw::advance(const GpuVmAccess &memory, CpuDispatchPool *pool,
-                                                   uint32_t threads, bool allow_ram_read_batching) {
-  if (fragment_stage_) {
-    write_outputs(memory, pool, threads);
-    fragments_.clear();
-    if (next_raster_group_ == vertex_groups_.size())
+                                                   uint32_t threads, bool allow_ram_read_batching,
+                                                   bool allow_early_depth) {
+  for (;;) {
+    if (fragment_stage_) {
+      write_outputs(memory, pool, threads);
+      fragments_.clear();
+      fragment_exports_.clear();
+      fragment_exports_prepared_ = false;
+      fragment_selection_active_ = false;
+      fragment_dispatch_indices_.clear();
+      if (next_raster_group_ == vertex_groups_.size())
+        return next_vertex_group();
+    }
+    // Bound retained fragments to one original group's output plus this window.
+    // All pending groups keep their own ring slots until their FS work retires.
+    constexpr size_t kFragmentWindowWaves = 4096;
+    while (next_raster_group_ < vertex_groups_.size()) {
+      const auto &group = vertex_groups_[next_raster_group_++];
+      finish_vertices(group);
+      rasterize(memory, group, pool, threads, allow_ram_read_batching);
+      if (fragments_.size() >= kFragmentWindowWaves)
+        break;
+    }
+    fragment_stage_ = true;
+    if (fragments_.empty())
       return next_vertex_group();
+    if (allow_early_depth)
+      select_fragment_waves(memory);
+    if (!fragment_selection_active_ || !fragment_dispatch_indices_.empty()) {
+      prepare_fragment_exports();
+      return fragment_dispatch();
+    }
+    // No shader was invoked, but retain every original late attachment visit
+    // and its ordinary failure/retirement path before advancing the draw.
   }
-  // Bound retained fragments to one original group's output plus this window.
-  // All pending groups keep their own ring slots until their FS work retires.
-  constexpr size_t kFragmentWindowWaves = 4096;
-  while (next_raster_group_ < vertex_groups_.size()) {
-    const auto &group = vertex_groups_[next_raster_group_++];
-    finish_vertices(group);
-    rasterize(memory, group, pool, threads, allow_ram_read_batching);
-    if (fragments_.size() >= kFragmentWindowWaves)
-      break;
-  }
-  fragment_stage_ = true;
-  if (fragments_.empty())
-    return next_vertex_group();
-  return fragment_dispatch();
 }
 
 } // namespace rocjitsu::amdgpu

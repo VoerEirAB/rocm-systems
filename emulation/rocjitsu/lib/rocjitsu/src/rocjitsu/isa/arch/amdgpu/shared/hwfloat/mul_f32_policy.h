@@ -1,14 +1,14 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-#ifndef ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_POLICY_H_
-#define ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_POLICY_H_
+#pragma once
 
 #include "rocjitsu/isa/arch/amdgpu/shared/fp_mode.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/mul_f32.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/instruction_encoding.h"
 #include "rocjitsu/vm/amdgpu/compute_unit.h"
 #include "rocjitsu/vm/amdgpu/wavefront.h"
+
 #include <type_traits>
 
 namespace rocjitsu::rdna3 {
@@ -62,7 +62,7 @@ template <typename Op> bool is_plain_mul_f32_operand(const Op &op, const Wavefro
 }
 
 template <typename Inst> bool has_qualified_mul_f32_policy(const Wavefront &wf) {
-  constexpr auto target = qualified_mul_f32_target<Inst>();
+  constexpr rj_code_target_id_t target = qualified_mul_f32_target<Inst>();
   return target != ROCJITSU_CODE_TARGET_INVALID && wf.cu().target() == target && !wf.dx10_clamp() &&
          (wf.wf_size() == 32 || wf.wf_size() == 64);
 }
@@ -99,5 +99,3 @@ bool has_qualified_mul_f32_vop3_policy(const Inst &inst, const Wavefront &wf) {
 
 } // namespace detail
 } // namespace rocjitsu::amdgpu::hwfloat
-
-#endif // ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_POLICY_H_

@@ -312,9 +312,15 @@ inline uint16_t fma_f32_to_f16_nearest_environment(float a, float b, float c, ui
     const auto exact = add_exact(double(a) * double(b), double(c));
     value = round_to_odd(exact);
     if (exact.value == 0 && exact.error == 0) {
-      // Exact cancellation and signed zeros use the destination rounding mode.
-      ScopedFenv result_environment(round_mode);
-      value = std::fma(double(a), double(b), double(c));
+      // Finite F32 products are exact, normal F64 values or signed zero.
+      // Matching signed zeros keep their sign; cancellation and opposite
+      // signed zeros are negative only when rounding toward negative infinity.
+      const uint32_t product_sign = (std::bit_cast<uint32_t>(a) ^ std::bit_cast<uint32_t>(b)) >> 31;
+      const uint32_t addend_bits = std::bit_cast<uint32_t>(c);
+      const bool matching_zeros =
+          (addend_bits & 0x7fffffffu) == 0 && product_sign == (addend_bits >> 31);
+      const bool negative = matching_zeros ? product_sign != 0 : (round_mode & 3u) == 2u;
+      value = std::bit_cast<double>(uint64_t{negative} << 63);
     }
   } else {
     value = std::fma(double(a), double(b), double(c));

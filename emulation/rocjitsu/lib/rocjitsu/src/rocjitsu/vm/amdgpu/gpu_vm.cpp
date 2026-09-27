@@ -654,6 +654,14 @@ std::unique_ptr<VmRamLease> GpuVmAccess::try_lease_ram(uint64_t address, std::si
 }
 
 std::unique_ptr<VmRamLease> GpuVmAccess::try_lease_ram(std::span<const VmRamRange> ranges) const {
+  auto request = prepare_ram_lease(ranges);
+  if (!request || !request->try_acquire())
+    return nullptr;
+  return request;
+}
+
+std::unique_ptr<VmRamLeaseRequest>
+GpuVmAccess::prepare_ram_lease(std::span<const VmRamRange> ranges) const {
   if (ranges.empty() || ranges.size() > VmRamLease::kMaxRanges || !access_state_ ||
       !access_state_->translator || !access_state_->physical_memory)
     return nullptr;
@@ -671,34 +679,53 @@ std::unique_ptr<VmRamLease> GpuVmAccess::try_lease_ram(std::span<const VmRamRang
       access_state_->translator->prepare_ram_lease(*access_state_->physical_memory, ranges);
   if (!request)
     return nullptr;
-  class Lease final : public VmRamLease {
+  class Lease final : public VmRamLeaseRequest {
   public:
     Lease(std::shared_ptr<GpuVmAccessState> state, std::unique_ptr<VmRamLeaseRequest> request)
         : state_(std::move(state)), request_(std::move(request)) {}
     ~Lease() override {
-      request_->release();
-      if (lock_.owns_lock())
-        lock_.unlock();
+      release();
       // Destroy/deallocate prepared storage only after every operation lock is
       // released: allocator instrumentation may reenter the address space.
       request_.reset();
     }
-    bool acquire() {
-      lock_ = std::shared_lock(state_->mutex);
-      return state_->valid && request_->try_acquire();
+    bool try_acquire() override {
+      if (attempted_ || released_)
+        return false;
+      attempted_ = true;
+      try {
+        lock_ = std::shared_lock(state_->mutex);
+        if (state_->valid && request_->try_acquire())
+          return true;
+      } catch (...) {
+        release();
+        throw;
+      }
+      release();
+      return false;
     }
-    std::span<std::byte> bytes(size_t index) const override { return request_->bytes(index); }
+    void release() override {
+      if (released_)
+        return;
+      request_->release();
+      if (lock_.owns_lock())
+        lock_.unlock();
+      released_ = true;
+    }
+    std::span<std::byte> bytes(size_t index) const override {
+      assert(lock_.owns_lock() && !released_);
+      return request_->bytes(index);
+    }
 
   private:
     std::shared_ptr<GpuVmAccessState> state_;
     std::shared_lock<util::DistributedSharedMutex> lock_;
     std::unique_ptr<VmRamLeaseRequest> request_;
+    bool attempted_ = false;
+    bool released_ = false;
   };
   // Both heap allocations precede access-state and mapping admission.
-  auto lease = std::make_unique<Lease>(access_state_, std::move(request));
-  if (!lease->acquire())
-    return nullptr;
-  return lease;
+  return std::make_unique<Lease>(access_state_, std::move(request));
 }
 
 std::byte *GpuVmAccess::resolve_host_pointer(uint64_t address, std::size_t size) const {
@@ -1257,19 +1284,25 @@ const GpuVmAccess *GpuVm::borrow_snapshot(AddressSpaceHandle handle) const {
   assert(GpuVmAccessBatchGuard::active());
   if (const GpuVmAccess *cached = GpuVmAccessBatchGuard::find_snapshot(this, handle))
     return cached;
-  if (const auto access = snapshot(handle))
+  if (const std::optional<GpuVmAccess> access = snapshot(handle)) {
     GpuVmAccessBatchGuard::retain_snapshot(this, handle, *access, false);
-  return GpuVmAccessBatchGuard::find_snapshot(this, handle);
+    // A concurrent revocation makes this access retryable, not an absent binding.
+    return &vm_access_batch_snapshots.back().access;
+  }
+  return nullptr;
 }
 
 const GpuVmAccess *GpuVm::borrow_snapshot_vmid(uint32_t vmid) const {
   assert(GpuVmAccessBatchGuard::active());
   if (const GpuVmAccess *cached = GpuVmAccessBatchGuard::find_snapshot_vmid(this, vmid))
     return cached;
-  if (const auto access = snapshot_vmid(vmid))
+  if (const std::optional<GpuVmAccess> access = snapshot_vmid(vmid)) {
     GpuVmAccessBatchGuard::retain_snapshot(this, access->cache_namespace().address_space, *access,
                                            true);
-  return GpuVmAccessBatchGuard::find_snapshot_vmid(this, vmid);
+    // A concurrent revocation makes this access retryable, not an absent binding.
+    return &vm_access_batch_snapshots.back().access;
+  }
+  return nullptr;
 }
 
 VmTranslationResult GpuVm::translate(AddressSpaceHandle handle, uint64_t address, std::size_t size,

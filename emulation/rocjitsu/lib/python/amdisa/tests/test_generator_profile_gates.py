@@ -8696,7 +8696,7 @@ def test_reciprocal_special_policy_keeps_existing_path(template):
 
 @pytest.mark.parametrize('operation', ['log', 'exp'])
 @pytest.mark.parametrize('form', ['vop1', 'vop3'])
-def test_integer_transcendental_precedes_host_environment(
+def test_log_exp_integer_batch_retains_host_environment(
     execute_shared_path: Path, operation, form
 ):
     source = execute_shared_path.read_text()
@@ -8704,7 +8704,22 @@ def test_integer_transcendental_precedes_host_environment(
     body = body.split('\ntemplate <', 1)[0]
     assert body.count('try_execute_transcendental_f32_simd') == 1
     assert (
-        body.index('try_execute_transcendental_f32_simd')
-        < body.index('fp_mode::ScopedEnvironment environment(0);')
+        body.index('fp_mode::ScopedEnvironment environment(0);')
+        < body.index('try_execute_transcendental_f32_simd')
         < body.index('ROCJITSU_TRY_SIMD_')
+    )
+
+
+@pytest.mark.parametrize('operation', ['sin', 'cos', 'rcp', 'rsq'])
+@pytest.mark.parametrize('form', ['vop1', 'vop3'])
+def test_other_integer_transcendentals_keep_unscoped_probe(
+    execute_shared_path: Path, operation, form
+):
+    source = execute_shared_path.read_text()
+    body = source.split(f'inline void execute_v_{operation}_f32_{form}(', 1)[1]
+    body = body.split('\ntemplate <', 1)[0]
+    assert body.count('try_execute_transcendental_f32_simd') == 1
+    assert 'fp_mode::ScopedEnvironment' not in body
+    assert body.index('try_execute_transcendental_f32_simd') < body.index(
+        'uint64_t exec = dpp::execution_lane_mask'
     )

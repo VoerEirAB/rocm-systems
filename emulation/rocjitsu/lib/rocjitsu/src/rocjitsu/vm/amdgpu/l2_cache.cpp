@@ -191,7 +191,7 @@ VmAccessOutcome L2Cache::publish_dirty_bytes_to_legacy_backing(uint64_t line_add
         clear_dirty_bytes(line_addr, start, static_cast<uint32_t>(completed_bytes), vmid);
       if (outcome != VmAccessOutcome::Complete)
         return outcome;
-      backing_write_transactions_.fetch_add(1, std::memory_order_relaxed);
+      diagnostics(line_addr + start).backing_writes.fetch_add(1, std::memory_order_relaxed);
     }
   }
   return VmAccessOutcome::Complete;
@@ -229,9 +229,9 @@ bool L2Cache::can_fetch_range(uint64_t addr, uint32_t size, uint32_t vmid) const
 VmAccessOutcome L2Cache::send_backing(uint64_t addr, uint8_t *data, uint32_t size,
                                       simdojo::MessageOp op, uint32_t vmid) {
   if (op == simdojo::MessageOp::WRITE)
-    backing_write_transactions_.fetch_add(1, std::memory_order_relaxed);
+    diagnostics(addr).backing_writes.fetch_add(1, std::memory_order_relaxed);
   else
-    backing_read_transactions_.fetch_add(1, std::memory_order_relaxed);
+    diagnostics(addr).backing_reads.fetch_add(1, std::memory_order_relaxed);
   if (backing_memory_) {
     if (vmid == 0 && op == simdojo::MessageOp::WRITE) {
       thread_local uint64_t wb_count = 0;
@@ -275,8 +275,8 @@ VmAccessOutcome L2Cache::send_backing(uint64_t addr, uint8_t *data, uint32_t siz
 VmAccessOutcome L2Cache::send_atomic_backing(uint64_t addr, uint32_t size,
                                              const simdojo::MemoryAtomicMutation &mutation,
                                              uint32_t vmid) {
-  backing_read_transactions_.fetch_add(1, std::memory_order_relaxed);
-  backing_write_transactions_.fetch_add(1, std::memory_order_relaxed);
+  diagnostics(addr).backing_reads.fetch_add(1, std::memory_order_relaxed);
+  diagnostics(addr).backing_writes.fetch_add(1, std::memory_order_relaxed);
   assert(req_port_ != nullptr && "L2Cache: req_port_ not set");
   if (req_port_->link() == nullptr ||
       req_port_->link()->exec_mode() != simdojo::ExecMode::FUNCTIONAL)
@@ -415,7 +415,7 @@ bool L2Cache::try_read_scalar_ram(uint64_t addr, uint32_t *dst, uint32_t num_dwo
     const bool copied =
         access->try_read_uncached_ram(addr, std::as_writable_bytes(std::span(dst, num_dwords)));
     if (copied)
-      backing_read_transactions_.fetch_add(1, std::memory_order_relaxed);
+      diagnostics(addr).backing_reads.fetch_add(1, std::memory_order_relaxed);
     return copied;
   });
 }
@@ -509,7 +509,7 @@ bool L2Cache::try_write_private_dwords(std::span<const VmRamDwordStore> stores,
       return false;
     if (!access->try_write_private_dwords(stores, instruction_mtype, mtype))
       return false;
-    backing_write_transactions_.fetch_add(stores.size(), std::memory_order_relaxed);
+    diagnostics(address).backing_writes.fetch_add(stores.size(), std::memory_order_relaxed);
     if (mtype != Mtype::UC) {
       for (const auto &store : stores) {
         simdojo::CacheTag *tag = nullptr;
@@ -519,7 +519,7 @@ bool L2Cache::try_write_private_dwords(std::span<const VmRamDwordStore> stores,
         tag->coherence = mtype == Mtype::CC ? simdojo::CoherenceState::SHARED
                                             : simdojo::CoherenceState::EXCLUSIVE;
       }
-      write_count_.fetch_add(stores.size(), std::memory_order_relaxed);
+      diagnostics(address).writes.fetch_add(stores.size(), std::memory_order_relaxed);
     }
     return true;
   });
@@ -579,7 +579,7 @@ VmAccessOutcome L2Cache::write(uint64_t addr, const uint8_t *src, uint32_t size,
                                 : (mtype == Mtype::CC ? simdojo::CoherenceState::SHARED
                                                       : simdojo::CoherenceState::EXCLUSIVE);
 
-    write_count_.fetch_add(1, std::memory_order_relaxed);
+    diagnostics(ea).writes.fetch_add(1, std::memory_order_relaxed);
     copied += chunk;
   }
   return VmAccessOutcome::Complete;
@@ -693,8 +693,7 @@ VmAccessOutcome L2Cache::flush_dirty_locked() {
   });
   if (dirty_count != 0)
     util::Logger::vm("L2 flush: ", dirty_count, " dirty lines [0x", std::hex, min_addr, "-0x",
-                     max_addr, "]", std::dec,
-                     " total_writes=", write_count_.load(std::memory_order_relaxed));
+                     max_addr, "]", std::dec, " total_writes=", write_count());
   return outcome;
 }
 

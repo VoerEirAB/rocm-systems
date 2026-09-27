@@ -788,10 +788,12 @@ public:
   /// The lifetime/protection proof of a sealed RAM lease without allocation.
   /// Exactly one extent is required: adjacent or overlapping extents can change
   /// original dword fault boundaries even when their host bytes are contiguous.
-  bool try_read_uncached_ram(uint64_t addr, std::span<std::byte> dst, uint32_t vmid) const {
-    if ((addr & 3) || dst.empty() || (dst.size() & 3) || dst.size() > 64 - (addr & 63))
+  /// The binding must retain expected beyond its enclosing VM-state lock.
+  bool try_read_uncached_ram(uint64_t addr, std::span<std::byte> dst, uint32_t vmid,
+                             const std::shared_ptr<util::DistributedSharedMutex> &expected) const {
+    if (!expected || (addr & 3) || dst.empty() || (dst.size() & 3) || dst.size() > 64 - (addr & 63))
       return false;
-    auto request = acquire_page_table_request(vmid);
+    auto request = acquire_page_table_request(vmid, expected);
     if (!request.owns_lock())
       return false;
     std::shared_lock page_table_lock(*request.page_table_mutex_);

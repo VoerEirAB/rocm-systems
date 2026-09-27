@@ -63,18 +63,21 @@ public:
   prepare_ram_lease(PhysicalMemoryAccess &physical,
                     std::span<const VmRamRange> ranges) const override {
     if (&physical != static_cast<const PhysicalMemoryAccess *>(this) || ranges.empty() ||
-        ranges.size() > VmRamLease::kMaxRanges)
+        ranges.size() > VmRamLease::kMaxRanges || !original_request_mutex_)
       return nullptr;
     class Request final : public VmRamLeaseRequest {
     public:
       Request(std::shared_ptr<LegacyAddressSpace> space, uint32_t vmid,
-              std::span<const VmRamRange> ranges)
-          : space_(std::move(space)), vmid_(vmid), count_(ranges.size()) {
+              std::span<const VmRamRange> ranges,
+              std::shared_ptr<util::DistributedSharedMutex> request_mutex)
+          : space_(std::move(space)), vmid_(vmid), count_(ranges.size()),
+            request_mutex_(std::move(request_mutex)) {
         std::copy(ranges.begin(), ranges.end(), ranges_.begin());
       }
       bool try_acquire() override {
         return space_->try_acquire_sealed_ram(std::span{ranges_}.first(count_), vmid_, request_,
-                                              mapping_, std::span{bytes_}.first(count_));
+                                              mapping_, std::span{bytes_}.first(count_),
+                                              request_mutex_);
       }
       void release() override {
         if (mapping_.owns_lock())
@@ -90,12 +93,15 @@ public:
       std::shared_ptr<LegacyAddressSpace> space_;
       uint32_t vmid_;
       size_t count_;
+      // Retain the known owner before outer operation locks. Raw registration
+      // replacement declines instead of releasing an unknown final owner there.
+      std::shared_ptr<util::DistributedSharedMutex> request_mutex_;
       std::array<VmRamRange, kMaxRanges> ranges_{};
       LegacyAddressSpace::PageTableRequestGuard request_;
       std::shared_lock<util::DistributedSharedMutex> mapping_;
       std::array<std::span<std::byte>, kMaxRanges> bytes_{};
     };
-    return std::make_unique<Request>(address_space_, vmid_, ranges);
+    return std::make_unique<Request>(address_space_, vmid_, ranges, original_request_mutex_);
   }
 
   [[nodiscard]] bool try_write_private_dwords(PhysicalMemoryAccess &physical,
@@ -110,7 +116,7 @@ public:
   [[nodiscard]] bool try_read_uncached_ram(PhysicalMemoryAccess &physical, uint64_t address,
                                            std::span<std::byte> bytes) const override {
     return &physical == static_cast<const PhysicalMemoryAccess *>(this) &&
-           address_space_->try_read_uncached_ram(address, bytes, vmid_);
+           address_space_->try_read_uncached_ram(address, bytes, vmid_, original_request_mutex_);
   }
 
   [[nodiscard]] VmTranslationResult translate(uint64_t address, std::size_t size,

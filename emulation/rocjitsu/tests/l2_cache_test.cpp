@@ -438,6 +438,60 @@ TEST(L2CacheTest, AtomicBoundaryFailureRetainsDirtyStateAndSuppressesMutation) {
   EXPECT_EQ(physical->load<uint32_t>(kAtomicAddress), kInitialAtomic + 1);
 }
 
+TEST(L2CacheTest, CleanBoundaryDeclinesDirtyParticipantsWithoutPublicationOrEpoch) {
+  constexpr uint32_t vmid = 76;
+  constexpr uint64_t address = 0x800;
+  constexpr uint32_t initial = 0x11223344, dirty = 0x55667788;
+  auto translator = std::make_shared<IdentityAddressSpace>(0x3000);
+  auto physical = std::make_shared<ConfigurablePhysicalMemory>(0x3000);
+  physical->store(address, initial);
+  GpuMemory memory("memory");
+  rocjitsu::amdgpu::GpuVm vm;
+  ASSERT_TRUE(vm.register_translated(vmid, translator, physical));
+  auto coherence = std::make_shared<rocjitsu::amdgpu::DeviceCacheCoherence>();
+  L2Cache first("first", coherence), second("second", coherence);
+  for (auto *l2 : {&first, &second}) {
+    l2->set_backing_memory(&memory);
+    l2->set_gpu_vm(&vm);
+  }
+  const auto before = coherence->current_epoch();
+  {
+    auto boundary = coherence->try_acquire_clean_boundary();
+    ASSERT_EQ(boundary.outcome(), rocjitsu::amdgpu::VmAccessOutcome::Complete);
+    EXPECT_TRUE(boundary.belongs_to(coherence.get()));
+    EXPECT_EQ(coherence->current_epoch(), before);
+    boundary.advance_data_epoch();
+    boundary.advance_data_epoch();
+    EXPECT_EQ(coherence->current_epoch(), before + 2);
+  }
+  std::array<uint8_t, L2Cache::LINE_SIZE> line{};
+  std::memcpy(line.data(), &dirty, sizeof(dirty));
+  ASSERT_EQ(second.writeback_line(address, line.data(), 0, sizeof(dirty), Mtype::RW, vmid),
+            rocjitsu::amdgpu::VmAccessOutcome::Complete);
+  physical->write_outcome = rocjitsu::amdgpu::VmAccessOutcome::Unavailable;
+  const auto writes = physical->write_calls;
+  {
+    auto boundary = coherence->try_acquire_clean_boundary();
+    EXPECT_EQ(boundary.outcome(), rocjitsu::amdgpu::VmAccessOutcome::Unavailable);
+    EXPECT_FALSE(boundary.belongs_to(coherence.get()));
+  }
+  EXPECT_EQ(physical->write_calls, writes);
+  EXPECT_EQ(physical->load<uint32_t>(address), initial);
+  EXPECT_EQ(coherence->current_epoch(), before + 2);
+  {
+    auto boundary = coherence->acquire_atomic_boundary();
+    EXPECT_EQ(boundary.outcome(), rocjitsu::amdgpu::VmAccessOutcome::Unavailable);
+  }
+  EXPECT_GT(physical->write_calls, writes);
+  physical->write_outcome = rocjitsu::amdgpu::VmAccessOutcome::Complete;
+  {
+    auto boundary = coherence->acquire_atomic_boundary();
+    ASSERT_EQ(boundary.outcome(), rocjitsu::amdgpu::VmAccessOutcome::Complete);
+  }
+  EXPECT_EQ(physical->load<uint32_t>(address), dirty);
+  EXPECT_EQ(coherence->current_epoch(), before + 3);
+}
+
 TEST(L2CacheTest, FailedDirectDirtyFlushRetainsLineForRetry) {
   constexpr uint32_t kVmid = 74;
   constexpr uint64_t kAddress = 0x800;
@@ -1734,6 +1788,10 @@ TEST(VectorRamBatch, RawRegistryReplacementRetainsOnlyOriginalRequestOwner) {
   ASSERT_TRUE(handle);
   auto access = vm.snapshot(handle);
   ASSERT_TRUE(access);
+  std::array<std::byte, 8> words;
+  words.fill(std::byte{0x5a});
+  ASSERT_TRUE(access->try_read_uncached_ram(8 * GpuMemory::PAGE_SIZE, words));
+  EXPECT_EQ(words, (std::array<std::byte, 8>{}));
   adapter.address_space(7)->register_process(7, &table, &page_mutex, nullptr,
                                              std::make_shared<util::DistributedSharedMutex>());
   request.reset();
@@ -1743,6 +1801,9 @@ TEST(VectorRamBatch, RawRegistryReplacementRetainsOnlyOriginalRequestOwner) {
       {{8 * GpuMemory::PAGE_SIZE, reinterpret_cast<const uint8_t *>(&word)},
        {8 * GpuMemory::PAGE_SIZE + 4, reinterpret_cast<const uint8_t *>(&word)}}};
   EXPECT_FALSE(access->try_write_private_dwords(stores, Mtype::UC, Mtype::UC));
+  words.fill(std::byte{0x5a});
+  EXPECT_FALSE(access->try_read_uncached_ram(8 * GpuMemory::PAGE_SIZE, words));
+  EXPECT_TRUE(std::ranges::all_of(words, [](std::byte value) { return value == std::byte{0x5a}; }));
   EXPECT_FALSE(*destroyed);
   EXPECT_TRUE(std::ranges::all_of(backing, [](uint8_t value) { return value == 0; }));
   ASSERT_TRUE(adapter.unregister_address_space(handle));
@@ -3756,6 +3817,116 @@ TEST(GpuMemoryTest, BlockAccessHandlesPageBoundaries) {
   memory.read_block(kAddr, std::span<uint8_t>(output));
 
   EXPECT_EQ(output, input);
+}
+
+TEST(L2DiagnosticCounters, JoinedTotalsCoverDistributedAndSharedLines) {
+  using namespace rocjitsu::amdgpu;
+  class StatelessMemory final : public PhysicalMemoryAccess {
+  public:
+    VmAccessOutcome read(VmMemoryDomain, uint64_t, std::span<std::byte> bytes) override {
+      std::ranges::fill(bytes, std::byte{0});
+      return VmAccessOutcome::Complete;
+    }
+    VmAccessOutcome write(VmMemoryDomain, uint64_t, std::span<const std::byte>) override {
+      return VmAccessOutcome::Complete;
+    }
+  };
+  constexpr uint32_t kThreads = 8, kOperations = 64;
+  for (const bool distributed : {false, true}) {
+    GpuVm vm;
+    auto translator = std::make_shared<IdentityAddressSpace>(1u << 20);
+    auto physical = std::make_shared<StatelessMemory>();
+    ASSERT_TRUE(vm.register_address_space(7, translator, physical, {}, true));
+    GpuMemory memory("diagnostic_memory");
+    L2Cache l2("diagnostic_l2");
+    l2.set_backing_memory(&memory);
+    l2.set_gpu_vm(&vm);
+    std::barrier start(kThreads);
+    std::atomic<bool> succeeded{true};
+    std::vector<std::thread> workers;
+    for (uint32_t thread = 0; thread < kThreads; ++thread) {
+      workers.emplace_back([&, thread] {
+        const uint32_t value = thread;
+        start.arrive_and_wait();
+        for (uint32_t i = 0; i < kOperations; ++i) {
+          const uint64_t address = distributed ? (thread + i * kThreads) * L2Cache::LINE_SIZE : 0;
+          for (const auto policy : {Mtype::RW, Mtype::UC}) {
+            if (l2.write(address, reinterpret_cast<const uint8_t *>(&value), sizeof(value), policy,
+                         7) != VmAccessOutcome::Complete)
+              succeeded.store(false, std::memory_order_relaxed);
+          }
+        }
+      });
+    }
+    for (auto &worker : workers)
+      worker.join();
+    ASSERT_TRUE(succeeded.load(std::memory_order_relaxed));
+    EXPECT_EQ(l2.write_count(), kThreads * kOperations);
+    EXPECT_EQ(l2.backing_write_transactions(), 2u * kThreads * kOperations);
+    EXPECT_EQ(l2.backing_read_transactions(), 0u);
+  }
+}
+
+TEST(L2DiagnosticCounters, ReentrantQueriesKeepAttemptAndSuccessBoundaries) {
+  using namespace rocjitsu::amdgpu;
+  class ObservedMemory final : public PhysicalMemoryAccess {
+  public:
+    void observe() {
+      snapshots.push_back({cache->backing_read_transactions(), cache->backing_write_transactions(),
+                           cache->write_count()});
+    }
+    VmAccessOutcome read(VmMemoryDomain, uint64_t, std::span<std::byte> bytes) override {
+      observe();
+      std::ranges::fill(bytes, std::byte{0});
+      return VmAccessOutcome::Complete;
+    }
+    VmAccessOutcome write(VmMemoryDomain, uint64_t, std::span<const std::byte>) override {
+      observe();
+      return write_outcome;
+    }
+    VmAccessOutcome atomic_modify(VmMemoryDomain, uint64_t, uint32_t width,
+                                  const AtomicMutation &mutation) override {
+      observe();
+      std::array<std::byte, sizeof(uint32_t)> bytes{};
+      if (width != bytes.size())
+        return VmAccessOutcome::Malformed;
+      mutation(bytes);
+      return VmAccessOutcome::Complete;
+    }
+    L2Cache *cache = nullptr;
+    VmAccessOutcome write_outcome = VmAccessOutcome::Complete;
+    std::vector<std::array<uint64_t, 3>> snapshots;
+  };
+  GpuVm vm;
+  auto translator = std::make_shared<IdentityAddressSpace>(1u << 20);
+  auto physical = std::make_shared<ObservedMemory>();
+  ASSERT_TRUE(vm.register_address_space(7, translator, physical, {}, true));
+  GpuMemory memory("diagnostic_observed_memory");
+  L2Cache l2("diagnostic_observed_l2");
+  physical->cache = &l2;
+  l2.set_backing_memory(&memory);
+  l2.set_gpu_vm(&vm);
+  const uint32_t value = 0x12345678;
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+  ASSERT_EQ(l2.write(0x68000, bytes, sizeof(value), Mtype::RW, 7), VmAccessOutcome::Complete);
+  physical->write_outcome = VmAccessOutcome::Faulted;
+  EXPECT_EQ(l2.write(0xe0000, bytes, sizeof(value), Mtype::RW, 7), VmAccessOutcome::Faulted);
+  physical->write_outcome = VmAccessOutcome::Complete;
+  ASSERT_EQ(l2.write(0x48000, bytes, sizeof(value), Mtype::UC, 7), VmAccessOutcome::Complete);
+  uint32_t loaded = 1;
+  ASSERT_EQ(l2.read(0x50000, reinterpret_cast<uint8_t *>(&loaded), sizeof(loaded), Mtype::UC, 7),
+            VmAccessOutcome::Complete);
+  ASSERT_EQ(l2.atomic_rmw(
+                0x58000, sizeof(value), [](uint8_t *, uint32_t) {}, 7),
+            VmAccessOutcome::Complete);
+  const std::vector<std::array<uint64_t, 3>> expected{
+      {0, 1, 0}, {0, 2, 1}, {0, 3, 1}, {1, 3, 1}, {2, 4, 1}};
+  EXPECT_EQ(physical->snapshots, expected);
+  ASSERT_EQ(l2.flush_all(), VmAccessOutcome::Complete);
+  l2.set_coherence_domain(std::make_shared<DeviceCacheCoherence>());
+  EXPECT_EQ(l2.backing_read_transactions(), 2u);
+  EXPECT_EQ(l2.backing_write_transactions(), 4u);
+  EXPECT_EQ(l2.write_count(), 1u);
 }
 
 } // namespace

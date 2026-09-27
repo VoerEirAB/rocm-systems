@@ -1,8 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-#ifndef ROCJITSU_ISA_AMDGPU_SHARED_HOST_FMA_SIMD_H_
-#define ROCJITSU_ISA_AMDGPU_SHARED_HOST_FMA_SIMD_H_
+#pragma once
 
 #include "util/simd.h"
 
@@ -55,5 +54,3 @@ template <typename Simd> inline Simd fused(Simd a, Simd b, Simd c) {
 }
 
 } // namespace rocjitsu::amdgpu::host_fma
-
-#endif // ROCJITSU_ISA_AMDGPU_SHARED_HOST_FMA_SIMD_H_

@@ -191,20 +191,21 @@ public:
   }
 };
 
+/// @brief Contiguous GPU virtual-address envelope for private RAM admission.
 struct VmRamRange {
   uint64_t address;
   std::size_t size;
 };
 
-/// One selected DWORD copied into caller-owned storage outside guest RAM.
+/// @brief One selected DWORD copied into caller-owned storage outside guest RAM.
 struct VmRamWordRead {
   uint64_t address;
   uint32_t *destination;
 };
 
-/// One ordered DWORD store from caller-owned, non-guest source storage.
+/// @brief One ordered DWORD store from caller-owned, non-guest source storage.
 struct VmRamDwordStore {
-  static constexpr size_t kMaxBatch = 32;
+  static constexpr std::size_t kMaxBatch = 32;
   uint64_t address;
   const uint8_t *source;
 };
@@ -383,21 +384,22 @@ class VmMtypeCache {
 /// @brief Address-space policy separated from the physical backing transport.
 class AddressSpaceTranslator {
 public:
-  /// Immutable backend capability only; every copy still needs live admission.
-  /// Reading this flag cannot invoke a translator callback or inspect mappings.
+  /// @brief Immutable backend capability; every copy still needs live admission.
+  /// @details Reading this flag cannot invoke a translator callback or inspect mappings.
   bool supports_ram_word_reads() const { return supports_ram_word_reads_; }
 
-  /// Optional ordered DWORD reads under one private RAM admission. Implementations
-  /// must qualify the exact transport and complete envelope before reading any
-  /// word. No allocation, fault publication or foreign callback is permitted.
+  /// @brief Optional ordered DWORD reads under one private RAM admission.
+  /// @details Implementations must qualify the exact transport and complete
+  /// envelope before reading any word. No allocation, fault publication or
+  /// foreign callback is permitted.
   /// False leaves every destination unchanged; repeated addresses remain reads.
   [[nodiscard]] virtual bool try_read_ram_words(PhysicalMemoryAccess &, VmRamRange,
                                                 std::span<const VmRamWordRead>) const {
     return false;
   }
 
-  /// Optional ordered same-line DWORD stores. False has no guest effects.
-  /// Implementations must prove every request under the same admission held
+  /// @brief Optional ordered same-line DWORD stores. False has no guest effects.
+  /// @details Implementations must prove every request under the same admission held
   /// through all copies, without allocation, callbacks or fault publication.
   [[nodiscard]] virtual bool try_write_private_dwords(PhysicalMemoryAccess &,
                                                       std::span<const VmRamDwordStore>, Mtype,
@@ -405,17 +407,19 @@ public:
     return false;
   }
 
-  /// Optional read from private, stable UC RAM. Implementations must refuse
-  /// unknown transports before touching guest data and must not allocate,
-  /// report faults, or invoke foreign callbacks. False leaves bytes unchanged.
+  /// @brief Optional read from private, stable UC RAM.
+  /// @details Implementations must refuse unknown transports before touching guest
+  /// data and must not allocate, report faults, or invoke foreign callbacks.
+  /// False leaves bytes unchanged.
   [[nodiscard]] virtual bool try_read_uncached_ram(PhysicalMemoryAccess &, uint64_t,
                                                    std::span<std::byte>) const {
     return false;
   }
 
-  /// Optional private, stable RAM capability. Unknown/translated/device backings
-  /// decline. The returned request is still unlocked; acquire checks permissions,
-  /// mapping lifetime and backing stability without touching guest data.
+  /// @brief Optional private, stable RAM capability.
+  /// @details Unknown/translated/device backings decline. The returned request is
+  /// still unlocked; acquire checks permissions, mapping lifetime and backing
+  /// stability without touching guest data.
   [[nodiscard]] virtual std::unique_ptr<VmRamLeaseRequest>
   prepare_ram_lease(PhysicalMemoryAccess &, std::span<const VmRamRange>) const {
     return nullptr;
@@ -613,6 +617,10 @@ public:
   /// under its lease, since this result can change immediately after the query.
   [[nodiscard]] bool is_valid() const;
   [[nodiscard]] AddressSpaceInfo info() const { return info_; }
+  /// Compare captured state identity without refreshing or admitting an access.
+  [[nodiscard]] bool shares_access_state(const GpuVmAccess &other) const {
+    return access_state_ == other.access_state_;
+  }
   [[nodiscard]] VmCacheNamespace cache_namespace() const {
     return {.address_space = address_space_, .translation_epoch = info_.translation_epoch};
   }
@@ -685,6 +693,12 @@ public:
   /// callers must retain their original ordered access path as fallback.
   [[nodiscard]] std::unique_ptr<VmRamLease> try_lease_ram(uint64_t address, std::size_t size) const;
   [[nodiscard]] std::unique_ptr<VmRamLease> try_lease_ram(std::span<const VmRamRange> ranges) const;
+  /// Allocate an unlocked private-RAM request. Acquire once at the original
+  /// operation boundary; release ends all admissions without destroying storage.
+  /// Failed acquisition releases its guards and has no guest effects. Destroy
+  /// the request outside any caller-owned locks: destruction may deallocate.
+  [[nodiscard]] std::unique_ptr<VmRamLeaseRequest>
+  prepare_ram_lease(std::span<const VmRamRange> ranges) const;
   [[nodiscard]] std::byte *resolve_host_pointer(uint64_t address, std::size_t size = 1) const;
   [[nodiscard]] std::pair<uint64_t, uint64_t> host_range(uint64_t address) const;
 

@@ -53,7 +53,13 @@ inline float reciprocal(float value) {
   const uint32_t product = (uint64_t{mantissa | 0x800000u} * seed) >> 11;
   const uint64_t refined = uint64_t{seed} * ((1u << 27) - product);
   const uint32_t normalized = 0x3e800000u + uint32_t((refined + 0x8000u) >> 16);
-  const float result = std::ldexp(std::bit_cast<float>(normalized), 127 - int(magnitude >> 23));
+  // The integer seed is normal. Scaling to another normal exponent is exact
+  // in every host mode; retain ldexp for subnormal and out-of-range results.
+  const int exponent = int(normalized >> 23) + 127 - int(magnitude >> 23);
+  const float result =
+      exponent > 0 && exponent < 255
+          ? std::bit_cast<float>((normalized & 0x7fffffu) | (uint32_t(exponent) << 23))
+          : std::ldexp(std::bit_cast<float>(normalized), 127 - int(magnitude >> 23));
   return std::copysign(result, value);
 }
 
@@ -186,7 +192,13 @@ inline float multiply_perspective(float a, float b) {
   if (a == 0 || b == 0 || !std::isfinite(a) || !std::isfinite(b))
     return a * b;
   const double product = double(a) * b;
-  const double unit = std::ldexp(1.0, std::ilogb(a) + std::ilogb(b) - 23);
+  const uint32_t a_exponent = (std::bit_cast<uint32_t>(a) >> 23) & 0xff;
+  const uint32_t b_exponent = (std::bit_cast<uint32_t>(b) >> 23) & 0xff;
+  // Two normal FP32 operands give an exact normal FP64 unit, even when
+  // their product is outside the FP32 range. Keep libm for subnormal inputs.
+  const double unit = a_exponent != 0 && b_exponent != 0
+                          ? std::bit_cast<double>(uint64_t(a_exponent + b_exponent + 746) << 52)
+                          : std::ldexp(1.0, std::ilogb(a) + std::ilogb(b) - 23);
   const double rounded = std::floor(std::abs(product) / unit + 0.5) * unit;
   return truncate_float(std::copysign(rounded, product));
 }
@@ -197,7 +209,24 @@ inline float add_quad_offsets(float center, float dx, float dy) {
   const float largest = std::max({std::abs(center), std::abs(dx), std::abs(dy)});
   if (largest == 0)
     return 0;
-  const double unit = std::ldexp(1.0, std::ilogb(largest) - 23);
+  const uint32_t magnitude = std::bit_cast<uint32_t>(largest);
+  double unit;
+  if (magnitude < 0x7f800000u) {
+    // A finite, nonzero FP32 magnitude has exponent -149..127. Its
+    // quantization unit is therefore an exact normal FP64 power of two;
+    // constructing its bits avoids libm without changing the arithmetic below.
+    const int exponent =
+        magnitude < 0x00800000u ? int(std::bit_width(magnitude)) - 150 : int(magnitude >> 23) - 127;
+    unit = std::bit_cast<double>(uint64_t(exponent + 1000) << 52);
+  } else {
+    const int exponent = std::ilogb(largest);
+    // Keep ilogb's domain reporting for a NaN center, but do not subtract
+    // from FP_ILOGBNAN: it can be INT_MIN. Propagate the center's sign and
+    // payload with its quiet bit set; no quantization unit exists for NaN.
+    if (magnitude > 0x7f800000u)
+      return std::bit_cast<float>(std::bit_cast<uint32_t>(center) | 0x00400000u);
+    unit = std::ldexp(1.0, exponent - 23);
+  }
   return truncate_float(
       (std::trunc(center / unit) + std::trunc(dx / unit) + std::trunc(dy / unit)) * unit);
 }
@@ -210,7 +239,71 @@ struct Plane {
     const float first = truncate_float(x * dx + y * dy + base);
     return add_quad_offsets(first, lane & 1 ? dx : 0, lane & 2 ? dy : 0);
   }
+
+#if defined(__clang__) && defined(__x86_64__)
+  // Inline the whole existing operation into the feature-specific caller, so
+  // truncation can use SSE4.1 without a separate call for each scalar value.
+  [[gnu::target("sse4.1"), gnu::noinline]] float at_quad_sse41(double x, double y,
+                                                               uint32_t lane) const {
+    [[clang::always_inline]] return at_quad(x, y, lane);
+  }
+#endif
 };
+
+// With integer pixel coordinates, these bounds keep every nonzero intermediate
+// normal in at_quad_sse41. Only SSE precision flags can be added. Inspect bits
+// so admission itself is inert even for signaling NaNs and subnormal inputs.
+inline bool bounded_plane_pair_for_integer_pixels(const Plane &first, const Plane &second,
+                                                  double origin_x, double origin_y) {
+  const auto grid_origin = [](double value) {
+    const uint64_t magnitude = std::bit_cast<uint64_t>(value) & 0x7fffffffffffffffull;
+    if (magnitude == 0)
+      return true;
+    if (magnitude > 0x41d0000000000000ull) // 2^30
+      return false;
+    const uint32_t exponent = magnitude >> 52;
+    if (exponent < 1015) // Nonzero grid points are at least 2^-8.
+      return false;
+    return (magnitude & ((uint64_t{1} << (1067 - exponent)) - 1)) == 0;
+  };
+  const auto coefficient = [](float value) {
+    const uint32_t magnitude = std::bit_cast<uint32_t>(value) & 0x7fffffffu;
+    return magnitude == 0 || (magnitude >= 0x30800000u && magnitude <= 0x4e800000u);
+  };
+  return grid_origin(origin_x) && grid_origin(origin_y) && coefficient(first.dx) &&
+         coefficient(first.dy) && coefficient(first.base) && coefficient(second.dx) &&
+         coefficient(second.dy) && coefficient(second.base);
+}
+
+inline bool supports_sse41_planes() {
+#if defined(__clang__) && defined(__x86_64__)
+  return __builtin_cpu_supports("sse4.1");
+#else
+  // GCC's existing truncation lowering has different precision-flag behavior.
+  return false;
+#endif
+}
+
+inline bool can_omit_bounded_planes(const Plane &first, const Plane &second, double origin_x,
+                                    double origin_y) {
+#if defined(__clang__) && defined(__x86_64__)
+  if (!supports_sse41_planes() ||
+      !bounded_plane_pair_for_integer_pixels(first, second, origin_x, origin_y))
+    return false;
+  uint16_t control;
+  uint32_t mxcsr;
+  // Nonwaiting reads preserve pending exceptions and raw x87 state. The
+  // bounded SSE helper can only add INEXACT, which must already be sticky.
+  asm volatile("fnstcw %0\n\tstmxcsr %1" : "=m"(control), "=m"(mxcsr) : : "memory");
+  return (control & 0x3f) == 0x3f && (mxcsr & 0x1fa0) == 0x1fa0;
+#else
+  (void)first;
+  (void)second;
+  (void)origin_x;
+  (void)origin_y;
+  return false;
+#endif
+}
 
 // Depth is evaluated around the center of each 8x8 tile. The center value
 // and local slopes share 30 significant bits, with enough exponent range
@@ -228,11 +321,19 @@ struct DepthPlane {
     const double largest = std::max({std::abs(center), 8 * std::abs(dx), 8 * std::abs(dy)});
     if (largest == 0 || !std::isfinite(largest))
       return static_cast<float>(center);
-    const double unit = std::ldexp(1.0, std::ilogb(largest) - 29);
+    const auto quantization_unit = [](double value, unsigned fraction_bits) {
+      const uint64_t exponent = (std::bit_cast<uint64_t>(value) >> 52) & 0x7ff;
+      // A normal power of two is exact in every host mode. Keep libm for
+      // subnormal units, including its range and floating-point reporting.
+      if (exponent > fraction_bits && exponent < 0x7ff)
+        return std::bit_cast<double>((exponent - fraction_bits) << 52);
+      return std::ldexp(1.0, std::ilogb(value) - int(fraction_bits));
+    };
+    const double unit = quantization_unit(largest, 29);
     const double tile_base = std::floor(center / unit) * unit;
-    const auto align_slope = [unit](double slope) {
+    const auto align_slope = [unit, quantization_unit](double slope) {
       if (slope < 0) {
-        const double slope_unit = std::ldexp(1.0, std::ilogb(slope) - 26);
+        const double slope_unit = quantization_unit(slope, 26);
         slope = -std::floor(-slope / slope_unit + 0.5) * slope_unit;
       }
       return std::floor(slope / unit) * unit;

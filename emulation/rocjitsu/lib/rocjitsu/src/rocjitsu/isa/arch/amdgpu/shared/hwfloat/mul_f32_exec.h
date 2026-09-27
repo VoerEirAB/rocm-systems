@@ -1,8 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-#ifndef ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_EXEC_H_
-#define ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_EXEC_H_
+#pragma once
 
 #include "rocjitsu/code/rj_code.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/fp_mode.h"
@@ -110,5 +109,3 @@ template <typename Inst> bool try_execute_qualified_mul_f32_vop3(Inst &inst, Wav
 }
 
 } // namespace rocjitsu::amdgpu::hwfloat
-
-#endif // ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_EXEC_H_

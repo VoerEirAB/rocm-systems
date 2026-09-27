@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: MIT
 
 rj_add_object_library(rocjitsu_vm_amdgpu
-    ../../isa/arch/amdgpu/shared/reciprocal_simd.cpp
-    ../../isa/arch/amdgpu/shared/transcendental_simd.cpp
     aql/aql_packet_processor.cpp
     aql/aql_queue_binding_factory.cpp
     circular_ring_reader.cpp

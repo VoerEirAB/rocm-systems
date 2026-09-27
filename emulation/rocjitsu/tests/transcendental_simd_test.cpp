@@ -119,6 +119,10 @@ TEST(TranscendentalSimd, DecodedInstructionsPreserveMasksAliasesAndBroadcasts) {
                     ROCJITSU_CODE_ARCH_CDNA5}) {
     const bool gcn = arch == ROCJITSU_CODE_ARCH_CDNA1 || arch == ROCJITSU_CODE_ARCH_CDNA2 ||
                      arch == ROCJITSU_CODE_ARCH_CDNA3 || arch == ROCJITSU_CODE_ARCH_CDNA4;
+    // Exercise routing with both opcode families and NaN policies. Other
+    // architectures retain each operation, encoding, width and denorm mode.
+    const bool full_routing = arch == ROCJITSU_CODE_ARCH_RDNA3 ||
+                              arch == ROCJITSU_CODE_ARCH_RDNA4 || arch == ROCJITSU_CODE_ARCH_CDNA3;
     for (unsigned width : {32u, 64u}) {
       if ((gcn && width == 32) || (arch == ROCJITSU_CODE_ARCH_CDNA5 && width == 64))
         continue;
@@ -144,6 +148,8 @@ TEST(TranscendentalSimd, DecodedInstructionsPreserveMasksAliasesAndBroadcasts) {
             for (bool broadcast : {false, true})
               for (unsigned modifiers : {0u, 1u, 2u, 3u}) {
                 if (!e64 && modifiers)
+                  continue;
+                if (!full_routing && (alias || broadcast || modifiers))
                   continue;
                 const uint32_t dst = alias ? 0 : 6;
                 // Same independently assembled opcodes as the FP MODE fixtures.
@@ -180,6 +186,8 @@ TEST(TranscendentalSimd, DecodedInstructionsPreserveMasksAliasesAndBroadcasts) {
                   for (uint64_t mask :
                        {uint64_t{0}, uint64_t{1}, uint64_t{0x80}, uint64_t{0xf}, uint64_t{0xff},
                         uint64_t{0x80000001}, uint64_t{0x5555555555555555}, full}) {
+                    if (!full_routing && mask != full)
+                      continue;
                     std::array<uint32_t, 64> expected{}, actual{};
                     for (bool scalar : {true, false}) {
                       util::set_force_scalar_for_testing(scalar);

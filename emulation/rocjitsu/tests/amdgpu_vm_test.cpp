@@ -447,6 +447,87 @@ TEST(GraphicsPlacementTest, ComputeObserversAndDebuggerKeepExistingSelection) {
   }
 }
 
+TEST(CommandProcessorTest, LargeInternalWorkgroupsKeepCallbackOrderAndReclaimFailedSetup) {
+  class WorkgroupWavesPlugin final : public ExecutionPlugin {
+  public:
+    WorkgroupWavesPlugin() : ExecutionPlugin("workgroup-waves") {}
+
+    std::vector<amdgpu::Wavefront *> group_waves;
+    std::vector<amdgpu::Wavefront *> wave_callbacks;
+    uint32_t workgroups = 0;
+
+    void onAmdgpuWorkgroupDispatched(uint32_t dispatch, uint32_t group, uint32_t, uint32_t,
+                                     std::span<amdgpu::Wavefront *> waves) override {
+      ++workgroups;
+      group_waves.assign(waves.begin(), waves.end());
+      wave_callbacks.clear();
+      for (uint32_t index = 0; index < waves.size(); ++index) {
+        EXPECT_EQ(waves[index]->dispatch_id(), dispatch);
+        EXPECT_EQ(waves[index]->wg_id(), group);
+        EXPECT_EQ(waves[index]->wave_in_group(), index);
+        EXPECT_EQ(waves[index]->lds().read32(waves[index]->lds_base() + index * 4),
+                  0x12340000u | group);
+      }
+    }
+
+    void onAmdgpuWavefrontDispatched(amdgpu::Wavefront &wave) override {
+      wave_callbacks.push_back(&wave);
+    }
+  };
+
+  // CDNA5 permits 64 resident Wave32 contexts. Internal entries can therefore
+  // exercise larger groups even though PM4 admission limits groups to 1024 threads.
+  for (uint32_t waves : {32u, 33u}) {
+    SCOPED_TRACE(waves);
+    VmFixture f("cdna5", 1, 64);
+    auto plugin = std::make_unique<WorkgroupWavesPlugin>();
+    auto *observed = plugin.get();
+    auto plugins = std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{});
+    ASSERT_TRUE(plugins->add(std::move(plugin)));
+    f.soc_ptr->set_plugin_group(plugins);
+    auto stage = std::make_shared<PlacementGraphicsStage>();
+    auto entry = graphics_placement_entry(1, stage);
+    entry.kernel_wave_size = 32;
+    entry.wfs_per_workgroup = waves;
+    entry.workgroup_size_x = entry.grid_size_x = waves * 32;
+
+    ASSERT_EQ(amdgpu::CommandProcessorPlacementTestAccess::place(*f.cp(), entry),
+              (std::pair{1u, amdgpu::VmAccessOutcome::Complete}));
+    ASSERT_EQ(stage->placements.size(), waves);
+    ASSERT_EQ(observed->group_waves.size(), waves);
+    EXPECT_EQ(observed->wave_callbacks, observed->group_waves);
+    EXPECT_EQ(observed->workgroups, 1u);
+    amdgpu::CommandProcessorPlacementTestAccess::retire(*f.cp(), entry, 0);
+    EXPECT_EQ(f.cu()->num_wfs(), 0u);
+
+    // Missing launch metadata fails after all waves have been reserved. None
+    // may escape to observers or keep resources needed by the following group.
+    entry.dispatch_id = 2;
+    entry.dispatched_wgs = 0;
+    entry.graphics_stage.reset();
+    entry.kernel_code_properties = 1;
+    entry.queue_ptr = 0x1000;
+    EXPECT_EQ(amdgpu::CommandProcessorPlacementTestAccess::place(*f.cp(), entry),
+              (std::pair{0u, amdgpu::VmAccessOutcome::Malformed}));
+    EXPECT_EQ(observed->workgroups, 1u);
+    EXPECT_EQ(f.cu()->num_wfs(), 0u);
+    EXPECT_TRUE(f.cu()->can_accept_workgroup(waves, 64 * 1024));
+
+    entry.dispatch_id = 3;
+    entry.graphics_stage = stage;
+    entry.kernel_code_properties = 0;
+    entry.queue_ptr = 0;
+    stage->placements.clear();
+    ASSERT_EQ(amdgpu::CommandProcessorPlacementTestAccess::place(*f.cp(), entry),
+              (std::pair{1u, amdgpu::VmAccessOutcome::Complete}));
+    EXPECT_EQ(stage->placements.size(), waves);
+    EXPECT_EQ(observed->workgroups, 2u);
+    EXPECT_EQ(observed->wave_callbacks, observed->group_waves);
+    amdgpu::CommandProcessorPlacementTestAccess::retire(*f.cp(), entry, 0);
+    EXPECT_EQ(f.cu()->num_wfs(), 0u);
+  }
+}
+
 TEST(ComputeUnitConfigTest, RejectsWavefrontSlotsAboveIsaMaximum) {
   EXPECT_THROW((void)VmFixture("cdna3", 1, 33), util::ConfigError);
 }
@@ -8453,6 +8534,162 @@ TEST(Pm4DispatchTest, GraphicsSpiPlacementPreservesAttributeRingAndBlendedExport
         EXPECT_TRUE(adapter.unregister_address_space(address_space));
       }
     }
+}
+
+TEST(Pm4DispatchTest, EarlyDepthOmitsOnlyPermittedShaderWavesAndRetiresNormally) {
+  for (bool gfx12 : {false, true}) {
+    // A deliberately unmapped PS proves actual omission. The same draw must
+    // still fail through the normal fence path whenever an observation or
+    // execution-preserving mode requires the shader to be dispatched.
+    for (uint32_t mode = 0; mode < 14; ++mode) {
+      SCOPED_TRACE(testing::Message() << gfx12 << ',' << mode);
+      constexpr uint32_t pid = 7, vertices = 3, width = 8;
+      constexpr uint64_t code = 0x8000, ps = 0x9000, ib = 0x4000, ring = 0x10000, output = 0x30000,
+                         depth = 0x38000, inputs = 0x40000;
+      KfdProcess process(pid);
+      std::array<uint8_t, 4096> code_backing{}, ib_backing{}, output_backing{}, depth_backing{},
+          input_backing{};
+      std::vector<uint8_t> ring_backing(65536);
+      process.map_pages(code, code_backing.data(), code_backing.size());
+      process.map_pages(ib, ib_backing.data(), ib_backing.size());
+      process.map_pages(ring, ring_backing.data(), ring_backing.size());
+      process.map_pages(inputs, input_backing.data(), input_backing.size());
+      process.map_pages(output, output_backing.data(), output_backing.size(), amdgpu::Mtype::RW,
+                        amdgpu::LegacyHostExtentOwner::DriverSealedRam);
+      process.map_pages(depth, depth_backing.data(), depth_backing.size(), amdgpu::Mtype::RW,
+                        amdgpu::LegacyHostExtentOwner::DriverSealedRam);
+      for (uint32_t vertex = 0; vertex < vertices; ++vertex) {
+        const std::array<float, 8> data{vertex == 2 ? 1.0f : -1.0f,
+                                        vertex == 1 ? 1.0f : -1.0f,
+                                        mode == 10 ? 0.25f : 0.75f,
+                                        1.0f,
+                                        1.0f,
+                                        0.25f,
+                                        0.5f,
+                                        1.0f};
+        std::memcpy(input_backing.data() + vertex * sizeof(data), data.data(), sizeof(data));
+      }
+      constexpr uint32_t initial_depth = 0x3f000000;
+      for (size_t offset = 0; offset < depth_backing.size(); offset += 4)
+        std::memcpy(depth_backing.data() + offset, &initial_depth, 4);
+      const auto initial = depth_backing;
+      const auto vs = graphics_ring_program(gfx12, false);
+      ASSERT_LE(vs.size() * 4, code_backing.size());
+      std::memcpy(code_backing.data(), vs.data(), vs.size() * 4);
+      VmFixture f(gfx12 ? "rdna4" : "rdna3", 2, 8, 64, 106, 256, 2, 0);
+      f.cp()->set_dispatch_threads(2);
+      if (mode == 3)
+        f.capture_halts();
+      if (mode == 9)
+        f.cu()->set_debug_active(true);
+      amdgpu::LegacyGpuVmAdapter adapter(f.soc_ptr->gpu_vm(), f.mem());
+      const auto address_space = adapter.register_address_space(
+          pid, {.page_table = &process.page_table_,
+                .page_table_mutex = &process.page_table_mutex_,
+                .page_table_generation = process.page_table_generation(),
+                .request_mutex = process.page_table_request_mutex(),
+                .mutation_epoch = process.page_table_mutation_epoch()});
+      ASSERT_TRUE(address_space);
+      auto state = std::make_shared<amdgpu::Pm4QueueState>();
+      state->uconfig_registers[0x242] = 4;
+      state->uconfig_registers[0x446] = ring >> 16;
+      auto &sh = state->sh_registers;
+      sh[gfx12 ? 0x89 : 0xc8] = code >> 8;
+      sh[0x8] = ps >> 8;
+      sh[0x8a] = sh[0xa] = 2;
+      sh[0x8b] = 8 << 1;
+      const std::array<uint32_t, 8> descriptors{uint32_t(ring),
+                                                (16u << 16) | (3u << 30),
+                                                65536,
+                                                2u << 21,
+                                                uint32_t(inputs),
+                                                32u << 16,
+                                                vertices,
+                                                0};
+      std::copy(descriptors.begin(), descriptors.end(), sh.begin() + 0x8c);
+      auto &ctx = state->context_registers;
+      ctx[gfx12 ? 0x2a6 : 0x2d5] = 1u << 22;
+      ctx[gfx12 ? 0x190 : 0x1b6] = (1u << 15) | (gfx12 ? 0u : 1u);
+      if (gfx12)
+        sh[0x31] = 1u << 11;
+      ctx[gfx12 ? 0x199 : 0x191] = 0x400;
+      ctx[0x2f9] = 0x2d;
+      ctx[gfx12 ? 0x205 : 0x206] = 0x43f;
+      ctx[0x30e] = ctx[0x30f] = 0xffffffff;
+      ctx[gfx12 ? 0x31e : 0x3b0] = gfx12 ? 7 | (7 << 16) : 7 | (7 << 14);
+      ctx[gfx12 ? 0x3b0 : 0x31c] = 10;
+      ctx[0x318] = output >> 8;
+      ctx[gfx12 ? 0x214 : 0x8e] = ctx[gfx12 ? 0x215 : 0x8f] = 15;
+      ctx[gfx12 ? 0x195 : 0x1c5] = 9;
+      ctx[gfx12 ? 0x216 : 0x202] = 0xcc0010;
+      ctx[gfx12 ? 0x1b : 0x203] = mode == 1 ? 0 : (1u << 4);
+      if (gfx12)
+        ctx[3] = 1u << 12; // RADV's ordinary FORCE_STENCIL_READ, with stencil off.
+      // Ordinary disabled-conservative rasterization state; modes11/12 enable
+      // actual over/under rasterization and must retain shader execution.
+      ctx[gfx12 ? 0x315 : 0x313] =
+          (1u << 20) | (mode == 11 ? 1u : 0u) | (mode == 12 ? 1u << 5 : 0u);
+      if (mode == 2)
+        ctx[gfx12 ? 0x1b : 0x203] |= 1u << 9;
+      if (mode == 4)
+        ctx[gfx12 ? 0x18 : 1] = 1u << 8;
+      ctx[gfx12 ? 5 : 7] = 7 | (7 << 16);
+      ctx[gfx12 ? 6 : 0x10] = 3;
+      ctx[gfx12 ? 8 : 0x12] = ctx[gfx12 ? 10 : 0x14] = depth >> 8;
+      ctx[gfx12 ? 0x1c : 0x200] = 6 | (1u << 4);
+      ctx[gfx12 ? 0x116 : 0xb5] = 0x3f800000;
+      ctx[0x113] = 0x3f800000;
+      ctx[0x10f] = ctx[0x110] = ctx[0x111] = ctx[0x112] = 0x40800000;
+      ctx[0x91] = (width - gfx12) | ((width - gfx12) << 16);
+      std::vector<uint32_t> words;
+      if (mode == 5 || mode == 6 || mode == 13) {
+        words.insert(words.end(), {0xc0004600, 25}); // PIPELINESTAT_START.
+        if (mode == 6)
+          words.insert(words.end(), {0xc0004600, 26});
+      }
+      if (mode == 7 || mode == 8)
+        words.insert(words.end(), {0xc0024600, 56u | (1u << 8),
+                                   (2u << 9) | (1u << 11) | (mode == 7 ? 1u << 3 : 0u), 0});
+      words.insert(words.end(), {0xc0012d00, vertices, 2});
+      // Counter enable is not a query. A real, still-unsupported result sample
+      // must retain its normal failure path after the permitted omitted draw.
+      if (mode == 13)
+        words.insert(words.end(), {0xc0024600, 30u | (2u << 8), uint32_t(output), 0});
+      std::memcpy(ib_backing.data(), words.data(), words.size() * 4);
+      amdgpu::Pm4SubmitQueue queue;
+      queue.address_space = address_space;
+      queue.queue_id = 71;
+      queue.process_id = pid;
+      queue.pm4 = state;
+      ASSERT_TRUE(f.cp()->register_drm_queue(std::move(queue)));
+      const bool omitted = mode == 0 || mode == 5 || mode == 6 || mode == 8;
+      uint32_t completions = 0;
+      amdgpu::Pm4Submission submission;
+      submission.graphics_engine = true;
+      submission.buffers.push_back({ib, uint32_t(words.size())});
+      auto failure = submission.failure;
+      f.engine->register_as_primary();
+      submission.complete = [&](bool success) {
+        EXPECT_EQ(success, omitted);
+        // Packet validation fails through the completion callback; the wave
+        // failure bit stays clear when the unmapped PS was correctly omitted.
+        EXPECT_EQ(failure->failed.load(), !omitted && mode != 13);
+        for (uint32_t se = 0; se < 2; ++se)
+          for (uint32_t cu = 0; cu < 2; ++cu)
+            EXPECT_FALSE(f.se(se)->compute_unit(cu)->has_active_wfs());
+        ++completions;
+        f.engine->primary_release();
+      };
+      ASSERT_TRUE(f.cp()->submit_pm4(71, pid, std::move(submission)));
+      f.engine->run();
+      EXPECT_EQ(completions, 1u);
+      EXPECT_FALSE(state->draw);
+      EXPECT_EQ(depth_backing, initial);
+      EXPECT_TRUE(std::ranges::all_of(output_backing, [](uint8_t value) { return value == 0; }));
+      f.cp()->unregister_drm_queue(71, pid);
+      EXPECT_TRUE(adapter.unregister_address_space(address_space));
+    }
+  }
 }
 
 TEST(Pm4DispatchTest, BatchedVertexFaultQuiescesBeforeCompletionAndObserversUseSerialGroups) {

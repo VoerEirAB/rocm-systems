@@ -1,8 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-#ifndef ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_H_
-#define ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_H_
+#pragma once
 
 #include <bit>
 #include <cstdint>
@@ -223,5 +222,3 @@ uint32_t multiply_f32_wave_avx512(const uint32_t *lhs, const uint32_t *rhs, uint
                                   uint64_t active, uint32_t lanes, MulF32Policy policy);
 
 } // namespace rocjitsu::amdgpu::hwfloat
-
-#endif // ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_MUL_F32_H_

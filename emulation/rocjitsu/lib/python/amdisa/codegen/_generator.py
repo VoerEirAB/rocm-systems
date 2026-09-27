@@ -14235,6 +14235,7 @@ class CodeGenerator:
             '#include "rocjitsu/isa/arch/amdgpu/shared/division.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/cube.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/mul_f32_exec.h"',
+            '#include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/dx9_mul_f32_exec.h"',
             *simd_extra_includes(),
             '#include "util/data_types.h"',
             '#include "util/except.h"',
@@ -14277,8 +14278,6 @@ class CodeGenerator:
             integer_probe = integer_transcendental_probe_line(
                 mnemonic, true16_vop3=is_true16_vop3
             )
-            if integer_probe is not None:
-                lines.append(integer_probe)
             probe = simd_probe_line(
                 mnemonic,
                 true16_vop3=is_true16_vop3,
@@ -14286,10 +14285,12 @@ class CodeGenerator:
                 include_integer_transcendentals=False,
             )
             if mnemonic.rsplit('_', 1)[0].upper() in FLUSH_NEAREST_F32_OPS:
-                # LOG/EXP ignore guest rounding. Keep output scaling and clamp
-                # under the saved environment too: OMOD can overflow or touch
-                # signaling NaNs, and SIMD clamp compares NaN results.
+                # LOG/EXP ignore guest rounding. Even the integer batch can
+                # allocate cold destination storage, so retain its original
+                # environment. OMOD and clamp also need this FP policy.
                 lines.append('  fp_mode::ScopedEnvironment environment(0);')
+            if integer_probe is not None:
+                lines.append(integer_probe)
             alu_classifiers = {
                 'v_mul_f32_vop2': 'classify_mul_f32_vop2',
                 'v_mul_f32_vop3': 'classify_mul_f32_vop3',
@@ -14306,6 +14307,8 @@ class CodeGenerator:
             qualified_probes = {
                 'v_mul_f32_vop2': 'try_execute_qualified_mul_f32_vop2',
                 'v_mul_f32_vop3': 'try_execute_qualified_mul_f32_vop3',
+                'v_mul_dx9_zero_f32_vop2': 'try_execute_qualified_dx9_mul_f32_vop2',
+                'v_mul_dx9_zero_f32_vop3': 'try_execute_qualified_dx9_mul_f32_vop3',
             }
             qualified_probe = qualified_probes.get(mnemonic)
             if qualified_probe is not None:

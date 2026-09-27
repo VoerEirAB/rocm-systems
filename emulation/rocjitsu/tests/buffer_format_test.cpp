@@ -53,6 +53,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
@@ -545,6 +546,63 @@ protected:
   }
 };
 
+TEST(BufferFormatTest, Unorm8FirstDestinationSeesDecodeExceptions) {
+  using Base = amdgpu::IsaExecComputeUnit<simdojo::ExecMode::FUNCTIONAL, rdna3::Isa>;
+  class RecordingCu final : public Base {
+  public:
+    using Base::Base;
+    int first_flags = -1;
+    size_t first_chunks = 0;
+    void write_vgpr(uint32_t reg, uint32_t lane, uint32_t value) override {
+      if (first_flags == -1) {
+        first_flags = std::fetestexcept(FE_ALL_EXCEPT);
+        first_chunks = vgpr_file().materialized_chunk_count();
+      }
+      Base::write_vgpr(reg, lane, value);
+    }
+  };
+  const amdgpu::fp_mode::detail::ScopedFenv restore_environment(0);
+  amdgpu::GpuMemory memory("unorm_first_touch");
+  amdgpu::L2Cache l2("l2");
+  l2.set_backing_memory(&memory);
+  amdgpu::ComputeUnitCore::Config config{};
+  config.arch = ROCJITSU_CODE_ARCH_RDNA3;
+  config.num_wf_slots = 1;
+  config.sgprs_per_wf = 106;
+  config.vgprs_per_wf = 32;
+  config.lds_size_kb = 64;
+  RecordingCu cu("cu", config, &memory, &l2);
+  auto *wf = cu.dispatch_wf(0, 0, 106, 32);
+  ASSERT_NE(wf, nullptr);
+  amdgpu::VectorMemState state(amdgpu::GLOBAL_MEM);
+  state.wf_size = 32;
+  state.exec_mask = state.lane_mask = 1;
+  state.elem_size = state.buffer_components = 4;
+  state.buffer_selectors = identity;
+  state.decoded_buffer_format = amdgpu::decode_buffer_format(42).value();
+  state.image_sampling = true;
+  state.dst_reg_base = wf->vgpr_alloc().base + 8;
+  state.image_sample = std::make_unique<amdgpu::ImageSampleAccess>();
+  auto &sample = *state.image_sample;
+  sample.tap_count = sample.taps_per_filter = 4;
+  sample.texels_per_tap = sample.filter_counts[0] = 1;
+  sample.taps.resize(4);
+  sample.filters.resize(1);
+  for (auto &tap : sample.taps)
+    tap.lane_mask = 1;
+  sample.filters[0].fractions[0][0] = {0.0f, 0.0f};
+  state.response_data.assign(4 * state.wf_size * state.elem_size, 1);
+  ASSERT_EQ(std::feclearexcept(FE_ALL_EXCEPT), 0);
+  amdgpu::complete_buffer_format_load(*wf, cu, state);
+  EXPECT_EQ(cu.first_chunks, 0u);
+  // Decoding 1/255 raises inexact before the first lazy allocation. The
+  // completion's environment guard restores the caller only after all writes.
+  EXPECT_EQ(cu.first_flags, FE_INEXACT);
+  EXPECT_EQ(std::fetestexcept(FE_ALL_EXCEPT), 0);
+  EXPECT_EQ(cu.read_vgpr(state.dst_reg_base, 0), 0x3b808081u);
+  wf->halt();
+}
+
 TEST_P(BufferFormatExecutionTest, Unorm8FilteringMatchesWidenedAlphaReference) {
   // Widening A to UNORM16 forces the generic decoder while preserving every
   // UNORM8 input exactly: byte * 257 / 65535 == byte / 255. The filter still
@@ -638,6 +696,121 @@ TEST_P(BufferFormatExecutionTest, Unorm8FilteringMatchesWidenedAlphaReference) {
           else
             EXPECT_EQ(value, expected[reg][lane]) << "reg=" << reg << " lane=" << lane;
         }
+    }
+  }
+}
+
+TEST_P(BufferFormatExecutionTest, Unorm8SingleFilterKeepsQ8BoundariesAndFallback) {
+  const amdgpu::fp_mode::detail::ScopedFenv restore_environment(0);
+  // Include adjacent FP32 values around the Q8 lattice. Non-Q8 descriptors
+  // must retain the general filter, including both mips' separate rounding.
+  constexpr std::array<uint32_t, 16> fraction_bits{0,          0x80000000, 0x3a800000, 0x3b7fffff,
+                                                   0x3b800000, 0x3b800001, 0x3c400000, 0x3c800000,
+                                                   0x3cc00000, 0x3effffff, 0x3f000000, 0x3f000001,
+                                                   0x3f7effff, 0x3f7f0000, 0x3f7fffff, 0x3f800000};
+  for (uint32_t test = 0; test < fraction_bits.size() * 8; ++test) {
+    SCOPED_TRACE(test);
+    const uint32_t levels = test < 2 ? 2 : 1 + (test / fraction_bits.size()) % 2;
+    const uint32_t taps = levels * 4;
+    amdgpu::VectorMemState fast(amdgpu::GLOBAL_MEM), reference(amdgpu::GLOBAL_MEM);
+    for (auto *state : {&fast, &reference}) {
+      state->wf_size = 4;
+      state->exec_mask = test >= 2 && (test & 1) ? 0b1010 : 0b1101;
+      state->lane_mask = test >= 2 && (test & 1) ? 0b1010 : 0b0101;
+      state->elem_size = 4;
+      state->buffer_components = test < 2 ? 4 : 1 + (test / 4) % 4;
+      state->buffer_d16 = (test / (fraction_bits.size() * 2)) & 1;
+      state->d16_hi = state->buffer_d16 && (test & 2);
+      state->lds_dst = (test / (fraction_bits.size() * 4)) & 1;
+      state->lds_base = 256;
+      state->buffer_selectors = identity;
+      state->decoded_buffer_format = amdgpu::decode_buffer_format(42).value();
+      state->image_sampling = true;
+      state->dst_reg_base = wf->vgpr_alloc().base + 8;
+      state->image_sample = std::make_unique<amdgpu::ImageSampleAccess>();
+      auto &sample = *state->image_sample;
+      sample.tap_count = sample.taps_per_filter = taps;
+      sample.texels_per_tap = 1;
+      sample.border_color = test % 3;
+      sample.taps.resize(taps);
+      sample.filters.resize(1);
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        sample.filter_counts[lane] = 1;
+        sample.mip_fractions[lane] =
+            std::bit_cast<float>(fraction_bits[(test + 3 * lane) % fraction_bits.size()]);
+        for (uint32_t level = 0; level < levels; ++level)
+          sample.filters[0].fractions[lane][level] = {
+              std::bit_cast<float>(fraction_bits[(test + level) % fraction_bits.size()]),
+              std::bit_cast<float>(fraction_bits[(test + lane + 5) % fraction_bits.size()])};
+      }
+      if (test < 2) {
+        // Q16 values (4,5) with mip=1/256 round to Q19 (32,0),
+        // then Q13 zero. Rounding their combined product would give one.
+        // (12,11) rounds through (96,0), then Q13 two, not one.
+        sample.mip_fractions[0] = 1.0f / 256;
+        sample.filters[0].fractions[0][0] = {1.0f / 256, (test ? 12.0f : 4.0f) / 256};
+        sample.filters[0].fractions[0][1] = {1.0f / 256, (test ? 11.0f : 5.0f) / 256};
+      }
+    }
+    // Independent existing path: widening alpha prevents integer-texel
+    // admission while byte * 257 / 65535 preserves the original UNORM8 value.
+    reference.decoded_buffer_format.widths[3] = 16;
+    reference.elem_size = 5;
+    fast.response_data.resize(taps * 4 * fast.elem_size);
+    reference.response_data.resize(taps * 4 * reference.elem_size);
+    for (uint32_t tap = 0; tap < taps; ++tap) {
+      const uint64_t lanes = tap % 3 == 1 ? 0b1001 : 0b1101;
+      fast.image_sample->taps[tap].lane_mask = lanes;
+      reference.image_sample->taps[tap].lane_mask = lanes;
+      for (uint32_t lane = 0; lane < 4; ++lane)
+        for (uint32_t c = 0; c < 4; ++c) {
+          const uint8_t value = c == 0   ? 0
+                                : c == 1 ? 255
+                                : c == 2 ? (tap == 3 || tap == 7)
+                                         : test * 19 + tap * 37;
+          fast.response_data[(tap * 4 + lane) * 4 + c] = value;
+          reference.response_data[(tap * 4 + lane) * 5 + c] = value;
+          if (c == 3)
+            reference.response_data[(tap * 4 + lane) * 5 + c + 1] = value;
+        }
+    }
+    const uint32_t registers =
+        fast.buffer_d16 ? (fast.buffer_components + 1) / 2 : fast.buffer_components;
+    for (const int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      SCOPED_TRACE(mode);
+      std::array<std::array<uint32_t, 4>, 4> expected{};
+      for (const auto *state : {&reference, &fast}) {
+        for (uint32_t reg = 0; reg < registers; ++reg)
+          for (uint32_t lane = 0; lane < 4; ++lane) {
+            constexpr uint32_t sentinel = 0xa57ec031;
+            cu->write_vgpr(state->dst_reg_base + reg, lane, sentinel);
+            wf->lds().write(state->lds_base + (lane * registers + reg) * 4,
+                            reinterpret_cast<const uint8_t *>(&sentinel), 4);
+          }
+        ASSERT_EQ(std::fesetround(mode), 0);
+        ASSERT_EQ(std::feclearexcept(FE_ALL_EXCEPT), 0);
+        ASSERT_EQ(std::feraiseexcept(FE_INVALID | FE_DIVBYZERO), 0);
+        errno = EILSEQ;
+        amdgpu::complete_buffer_format_load(*wf, *cu, *state);
+        const int saved_errno = errno;
+        EXPECT_EQ(std::fegetround(), mode);
+        EXPECT_EQ(std::fetestexcept(FE_ALL_EXCEPT), FE_INVALID | FE_DIVBYZERO);
+        EXPECT_EQ(saved_errno, EILSEQ);
+        for (uint32_t reg = 0; reg < registers; ++reg)
+          for (uint32_t lane = 0; lane < 4; ++lane) {
+            uint32_t value = 0;
+            if (state->lds_dst)
+              static_cast<const amdgpu::Lds &>(wf->lds()).read(
+                  state->lds_base + (lane * registers + reg) * 4,
+                  reinterpret_cast<uint8_t *>(&value), 4);
+            else
+              value = cu->read_vgpr(state->dst_reg_base + reg, lane);
+            if (state == &reference)
+              expected[reg][lane] = value;
+            else
+              EXPECT_EQ(value, expected[reg][lane]) << "reg=" << reg << " lane=" << lane;
+          }
+      }
     }
   }
 }

@@ -117,11 +117,13 @@ public:
   void set_coherence_domain(std::shared_ptr<DeviceCacheCoherence> coherence);
   const std::shared_ptr<DeviceCacheCoherence> &coherence_domain() const { return coherence_; }
 
+  /// Diagnostic totals are exact at quiescence. Concurrent queries sample
+  /// independent relaxed shards, not one instantaneous global snapshot.
   uint64_t backing_read_transactions() const {
-    return backing_read_transactions_.load(std::memory_order_relaxed);
+    return diagnostic_total(&DiagnosticCounters::backing_reads);
   }
   uint64_t backing_write_transactions() const {
-    return backing_write_transactions_.load(std::memory_order_relaxed);
+    return diagnostic_total(&DiagnosticCounters::backing_writes);
   }
 
   /// @brief Return whether a range may be read speculatively for a cache fill.
@@ -163,7 +165,9 @@ public:
                                               Mtype instruction_mtype, Mtype effective_mtype,
                                               uint32_t vmid);
 
-  uint64_t write_count() const { return write_count_.load(std::memory_order_relaxed); }
+  /// Successful cached write chunks; UC bypass writes are not included.
+  /// Like backing transaction totals, concurrent queries sample each shard.
+  uint64_t write_count() const { return diagnostic_total(&DiagnosticCounters::writes); }
 
   /// @brief Fetch an entire cache line into the given buffer.
   ///
@@ -221,8 +225,8 @@ public:
       return VmAccessOutcome::Malformed;
 
     if (backing_memory_) {
-      backing_read_transactions_.fetch_add(1, std::memory_order_relaxed);
-      backing_write_transactions_.fetch_add(1, std::memory_order_relaxed);
+      diagnostics(addr).backing_reads.fetch_add(1, std::memory_order_relaxed);
+      diagnostics(addr).backing_writes.fetch_add(1, std::memory_order_relaxed);
       if (vmid == 0) {
         const bool modified =
             backing_memory_->atomic_modify(addr, size, [&](uint8_t *target) { fn(target, 0); });
@@ -396,12 +400,28 @@ private:
   std::map<std::pair<uint32_t, uint64_t>, DirtyMask> dirty_bytes_;
   std::atomic<bool> has_dirty_lines_{false};
   std::vector<simdojo::Port *> cpl_ports_;
-  // Keep transfer counters off the read-mostly dirty-state cache line.
-  alignas(64) std::atomic<uint64_t> write_count_ = 0; ///< Debug: total L2 writes (for trace).
-  // Relaxed atomics: independent cache operations can update these counters
-  // concurrently; the values are diagnostic only.
-  std::atomic<uint64_t> backing_read_transactions_{0};
-  std::atomic<uint64_t> backing_write_transactions_{0};
+  struct alignas(64) DiagnosticCounters {
+    std::atomic<uint64_t> writes{0};
+    std::atomic<uint64_t> backing_reads{0};
+    std::atomic<uint64_t> backing_writes{0};
+  };
+  static constexpr uint32_t kDiagnosticShards = 64;
+
+  DiagnosticCounters &diagnostics(uint64_t address) {
+    const uint32_t set = CacheStore::set_index(address);
+    // Fold the high set bits so page-aligned accesses use distinct shards.
+    return diagnostics_[(set ^ (set >> 6)) & (kDiagnosticShards - 1)];
+  }
+
+  uint64_t diagnostic_total(std::atomic<uint64_t> DiagnosticCounters::*counter) const {
+    uint64_t total = 0;
+    for (const auto &shard : diagnostics_)
+      total += (shard.*counter).load(std::memory_order_relaxed);
+    return total;
+  }
+
+  // Accounting has no cache/coherence role and never shares a dirty-state line.
+  std::array<DiagnosticCounters, kDiagnosticShards> diagnostics_{};
 };
 
 } // namespace amdgpu

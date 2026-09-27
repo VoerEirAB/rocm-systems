@@ -37,6 +37,7 @@
 #include "util/simd_test_hooks.h"
 
 #include "rocjitsu/code/rj_code.h"
+#include "rocjitsu/isa/arch/amdgpu/generated/rdna3/vop3p.h"
 #include "rocjitsu/isa/arch/amdgpu/generated/shared/execute_shared.h"
 #include "rocjitsu/isa/decoder.h"
 #include "rocjitsu/isa/instruction.h"
@@ -276,7 +277,7 @@ template <uint32_t WF_SIZE, int ArchTag> struct Fixture {
     cfg.lds_size_kb = 64;
     cu = amdgpu::ComputeUnitCore::create("cu_vop3p_fma_mix", cfg, &gpu_mem, &l2);
     decoder = Decoder::create(cfg.arch);
-    wf = cu->dispatch_wf(0, 0, SGPRS_PER_WF, VGPRS_PER_WF);
+    wf = cu->dispatch_wf(0, 0, SGPRS_PER_WF, VGPRS_PER_WF, WF_SIZE);
   }
 
   void seed_vgprs(uint32_t rot, bool widen0, bool widen1, bool widen2, uint64_t exec,
@@ -451,6 +452,97 @@ TEST(Vop3pFmaMixSimdCorrectness, RdnaFmaMixHiF16_PartialExec) {
     return;
   }
   check_op<32, 0>(kVop3pOpFmaMixHiF16, kPartialExecRdna, DST_SENTINEL, "v_fma_mixhi_f16");
+}
+
+// Directly require admission: result parity alone would also pass if the new
+// scope path declined every directed-rounding wave.
+TEST(Vop3pFmaMixSimdCorrectness, DirectedWaveScopePreservesAliasesAndInactiveHalves) {
+  ForceScalarGuard guard;
+  auto check = []<uint32_t Size>() {
+    Fixture<Size, 0> fx;
+    const uint64_t all = util::mask<uint64_t>(Size);
+    for (uint32_t round = 1; round < 4; ++round) {
+      for (bool high : {false, true}) {
+        for (uint32_t destination : {0u, kDstVgpr}) {
+          for (uint64_t mask :
+               {all, all & uint64_t{0x8000000180000004}, uint64_t{1} << (Size - 1)}) {
+            uint32_t words[4]{};
+            vop3p_encode_rdna3(high ? kVop3pOpFmaMixHiF16 : kVop3pOpFmaMixLoF16, destination, 2, 5,
+                               1, 0, 256, 257, 258, 1, 4, words);
+            std::unique_ptr<Instruction> inst(decode_valid(*fx.decoder, words));
+            ASSERT_NE(inst, nullptr);
+            auto seed = [&] {
+              fx.seed_vgprs(round, true, false, true, mask, DST_SENTINEL);
+              fx.wf->set_mode_raw(0xc0 | (round << 2));
+            };
+            seed();
+            util::set_force_scalar_for_testing(true);
+            ASSERT_TRUE(fx.cu->execute_instruction(inst.get(), *fx.wf).succeeded());
+            std::array<uint32_t, Size> expected{};
+            for (uint32_t lane = 0; lane < Size; ++lane)
+              expected[lane] = fx.cu->read_vgpr(fx.wf->vgpr_alloc().base + destination, lane);
+            seed();
+            util::set_force_scalar_for_testing(false);
+            bool admitted;
+            if (high) {
+              auto *typed = dynamic_cast<rdna3::VFmaMixhiF16Vop3p *>(inst.get());
+              ASSERT_NE(typed, nullptr);
+              admitted =
+                  amdgpu::try_execute_fma_mix_f16_wave<amdgpu::FmaMixDst::F16_HI>(*typed, *fx.wf);
+            } else {
+              auto *typed = dynamic_cast<rdna3::VFmaMixloF16Vop3p *>(inst.get());
+              ASSERT_NE(typed, nullptr);
+              admitted =
+                  amdgpu::try_execute_fma_mix_f16_wave<amdgpu::FmaMixDst::F16_LO>(*typed, *fx.wf);
+            }
+            ASSERT_TRUE(admitted);
+            for (uint32_t lane = 0; lane < Size; ++lane)
+              EXPECT_EQ(fx.cu->read_vgpr(fx.wf->vgpr_alloc().base + destination, lane),
+                        expected[lane])
+                  << "round=" << round << " high=" << high << " destination=" << destination
+                  << " lane=" << lane;
+          }
+        }
+      }
+    }
+  };
+  check.template operator()<32>();
+  check.template operator()<64>();
+}
+
+TEST(Vop3pFmaMixSimdCorrectness, WaveScopeDeclinesScalarControlBeforeEffects) {
+  ForceScalarGuard guard;
+  Fixture<32, 0> fx;
+  uint32_t words[4]{};
+  vop3p_encode_rdna3(kVop3pOpFmaMixLoF16, kDstVgpr, 0, 0, 0, 0, 256, 257, 258, 0, 0, words);
+  std::unique_ptr<Instruction> inst(decode_valid(*fx.decoder, words));
+  auto *typed = dynamic_cast<rdna3::VFmaMixloF16Vop3p *>(inst.get());
+  ASSERT_NE(typed, nullptr);
+  fx.seed_vgprs(0, false, false, false, kFullExecRdna, DST_SENTINEL);
+  fx.wf->set_mode_raw(0xcc);
+  util::set_force_scalar_for_testing(true);
+  EXPECT_FALSE((amdgpu::try_execute_fma_mix_f16_wave<amdgpu::FmaMixDst::F16_LO>(*typed, *fx.wf)));
+  for (uint32_t lane = 0; lane < 32; ++lane)
+    EXPECT_EQ(fx.cu->read_vgpr(fx.wf->vgpr_alloc().base + kDstVgpr, lane), DST_SENTINEL);
+}
+
+TEST(Vop3pFmaMixSimdCorrectness, WaveScopeDeclinesNearestAndPartialWritesBeforeEffects) {
+  ForceScalarGuard guard;
+  Fixture<32, 0> fx;
+  uint32_t words[4]{};
+  vop3p_encode_rdna3(kVop3pOpFmaMixLoF16, kDstVgpr, 0, 0, 0, 0, 256, 257, 258, 0, 0, words);
+  std::unique_ptr<Instruction> inst(decode_valid(*fx.decoder, words));
+  auto *typed = dynamic_cast<rdna3::VFmaMixloF16Vop3p *>(inst.get());
+  ASSERT_NE(typed, nullptr);
+  util::set_force_scalar_for_testing(false);
+  for (uint32_t round : {0u, 3u}) {
+    fx.seed_vgprs(0, false, false, false, kFullExecRdna, DST_SENTINEL);
+    fx.wf->set_mode_raw(0xc0 | (round << 2));
+    fx.wf->set_vgpr_write_mask(round == 0 ? kFullExecRdna : 0xfffffffeu);
+    EXPECT_FALSE((amdgpu::try_execute_fma_mix_f16_wave<amdgpu::FmaMixDst::F16_LO>(*typed, *fx.wf)));
+    for (uint32_t lane = 0; lane < 32; ++lane)
+      EXPECT_EQ(fx.cu->read_vgpr(fx.wf->vgpr_alloc().base + kDstVgpr, lane), DST_SENTINEL);
+  }
 }
 
 // --- CDNA4: v_mad_mix_* ---

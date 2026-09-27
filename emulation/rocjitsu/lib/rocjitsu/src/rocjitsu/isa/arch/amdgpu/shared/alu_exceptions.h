@@ -86,7 +86,7 @@ uint32_t classify_mul_lanes(const Lhs &lhs, const Rhs &rhs, Wavefront &wf, Class
 template <typename Lhs, typename Rhs>
 uint32_t classify_qualified_mul_f32_lanes(const Lhs &lhs, const Rhs &rhs, Wavefront &wf,
                                           uint32_t abs = 0, uint32_t neg = 0) {
-  const auto policy = hwfloat::detail::mul_f32_policy(wf);
+  const hwfloat::MulF32Policy policy = hwfloat::detail::mul_f32_policy(wf);
   return classify_mul_lanes(lhs, rhs, wf, [&](float a, float b) {
     uint32_t a_bits = std::bit_cast<uint32_t>(a);
     uint32_t b_bits = std::bit_cast<uint32_t>(b);

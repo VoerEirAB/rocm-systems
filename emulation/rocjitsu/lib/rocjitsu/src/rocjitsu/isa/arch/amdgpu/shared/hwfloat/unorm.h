@@ -1,8 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc.
 // SPDX-License-Identifier: MIT
 
-#ifndef ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_UNORM_H_
-#define ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_UNORM_H_
+#pragma once
 
 #include <cassert>
 #include <cstdint>
@@ -38,5 +37,3 @@ constexpr uint32_t unorm_from_f32(uint32_t bits, uint32_t width) {
 }
 
 } // namespace rocjitsu::amdgpu::hwfloat
-
-#endif // ROCJITSU_ISA_ARCH_AMDGPU_SHARED_HWFLOAT_UNORM_H_

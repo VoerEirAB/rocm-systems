@@ -1967,6 +1967,68 @@ TEST(ValuFpModeHelpers, RoundingAndSignedZero) {
   }
 }
 
+TEST(ValuFpModeHelpers, MixedF16FmaExactZeroSigns) {
+  struct Case {
+    uint32_t a, b, c;
+    std::array<uint16_t, 4> expected;
+  };
+  constexpr std::array<Case, 8> cases{{
+      {0, 0x3f800000, 0, {0, 0, 0, 0}},
+      {0, 0x3f800000, 0x80000000, {0, 0, 0x8000, 0}},
+      {0x80000000, 0x3f800000, 0, {0, 0, 0x8000, 0}},
+      {0x80000000, 0x3f800000, 0x80000000, {0x8000, 0x8000, 0x8000, 0x8000}},
+      {0, 0xbf800000, 0, {0, 0, 0x8000, 0}},
+      {0, 0xbf800000, 0x80000000, {0x8000, 0x8000, 0x8000, 0x8000}},
+      {0x80000000, 0xbf800000, 0, {0, 0, 0, 0}},
+      {0x80000000, 0xbf800000, 0x80000000, {0, 0, 0x8000, 0}},
+  }};
+  for (const auto &test : cases)
+    for (bool zero_second : {false, true})
+      for (bool swap : {false, true})
+        for (bool clamp : {false, true})
+          for (uint32_t mode = 0; mode < 4; ++mode) {
+            uint32_t a = test.a, b = zero_second ? test.b & 0x80000000u : test.b;
+            if (swap)
+              std::swap(a, b);
+            amdgpu::fp_mode::ScopedEnvironment environment(0);
+            const uint16_t actual = amdgpu::fp_mode::detail::fma_f32_to_f16_nearest_environment(
+                std::bit_cast<float>(a), std::bit_cast<float>(b), std::bit_cast<float>(test.c),
+                mode, clamp, false, false);
+            EXPECT_EQ(actual, clamp ? 0u : test.expected[mode]);
+          }
+}
+
+TEST(ValuFpModeHelpers, MixedF16FmaCancellationAcrossF32Range) {
+  constexpr std::array<std::array<uint32_t, 3>, 5> cases{{
+      {0x7f7fffff, 0x3f800000, 0xff7fffff},
+      {1, 0x3f800000, 0x80000001},
+      {0x00800000, 0x3f000000, 0x80400000},
+      {0x5f800000, 0x1f800000, 0xbf800000},
+      {0x00800000, 0x34000000, 0x80000001},
+  }};
+  for (const auto &test : cases)
+    for (uint32_t mode = 0; mode < 4; ++mode) {
+      amdgpu::fp_mode::ScopedEnvironment environment(0);
+      EXPECT_EQ(amdgpu::fp_mode::detail::fma_f32_to_f16_nearest_environment(
+                    std::bit_cast<float>(test[0]), std::bit_cast<float>(test[1]),
+                    std::bit_cast<float>(test[2]), mode, false, false, false),
+                mode == 2 ? 0x8000u : 0u);
+    }
+  // These products are far below F16 range, but are nonzero F64 values. A
+  // sign-only repair must not turn directed underflow into exact cancellation.
+  for (uint32_t mode = 0; mode < 4; ++mode) {
+    amdgpu::fp_mode::ScopedEnvironment environment(0);
+    EXPECT_EQ(
+        amdgpu::fp_mode::detail::fma_f32_to_f16_nearest_environment(
+            std::bit_cast<float>(1u), std::bit_cast<float>(1u), 0.0f, mode, false, false, false),
+        mode == 1 ? 1u : 0u);
+    EXPECT_EQ(amdgpu::fp_mode::detail::fma_f32_to_f16_nearest_environment(
+                  std::bit_cast<float>(0x80000001u), std::bit_cast<float>(1u), 0.0f, mode, false,
+                  false, false),
+              mode == 2 ? 0x8001u : 0x8000u);
+  }
+}
+
 TEST(ValuFpModeHelpers, F16FmaRetainsTinyProduct) {
   // Both physical cards round 65504 + 2^-48 upward to infinity. A host F64
   // addition alone loses the tiny product and incorrectly returns 65504.

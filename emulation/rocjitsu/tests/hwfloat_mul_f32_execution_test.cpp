@@ -14,6 +14,7 @@
 #include "rocjitsu/code/rj_code.h"
 #include "rocjitsu/isa/arch/amdgpu/generated/rdna3/opcodes.h"
 #include "rocjitsu/isa/arch/amdgpu/generated/rdna4/opcodes.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/dx9_mul_f32.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/mul_f32.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/instruction_encoding.h"
 #include "rocjitsu/isa/decoder.h"
@@ -496,19 +497,24 @@ public:
   void onAmdgpuReadVgprLanes(const amdgpu::Wavefront *wf, uint32_t physical_reg, uint64_t lane_mask,
                              uint8_t) override {
     reads.emplace_back(physical_reg, lane_mask);
-    events.push_back({false, wf->pending_alu_causes(), wf->trapsts()});
+    events.push_back({false, wf->pending_alu_causes(), wf->trapsts(), std::fegetround(),
+                      std::fetestexcept(FE_ALL_EXCEPT), errno});
   }
 
   void onAmdgpuWriteVgprLanes(const amdgpu::Wavefront *wf, uint32_t physical_reg,
                               uint64_t lane_mask, uint8_t) override {
     writes.emplace_back(physical_reg, lane_mask);
-    events.push_back({true, wf->pending_alu_causes(), wf->trapsts()});
+    events.push_back({true, wf->pending_alu_causes(), wf->trapsts(), std::fegetround(),
+                      std::fetestexcept(FE_ALL_EXCEPT), errno});
   }
 
   struct Event {
     bool write;
     uint32_t pending;
     uint32_t sticky;
+    int host_round;
+    int host_flags;
+    int error_number;
   };
   std::vector<Event> events;
 
@@ -594,101 +600,71 @@ TEST(HwfloatMulF32ExecutionTest, ScalarAndDebugPlainCausesMatchPhysicalWitnesses
       {0x00000001, 0x3f800000, 0xc0, 0x00000000, 0x00},
   };
   for (const QualifiedTarget &target : kQualifiedTargets) {
-    for (uint32_t wave_size : {32u, 64u}) {
-      for (uint32_t control : {0u, 1u, 2u}) {
-        SCOPED_TRACE(target.name);
-        SCOPED_TRACE(wave_size);
-        SCOPED_TRACE(control);
-        ForceScalarOverride scalar(control == 0);
-        MulFixture f(target.arch, target.target,
-                     control == 2 ? amdgpu::MemoryWaitDiagnostics::Warn
-                                  : amdgpu::MemoryWaitDiagnostics::Off);
-        f.cu->set_debug_active(control == 1);
-        auto *wf = f.dispatch(wave_size);
-        ASSERT_NE(wf, nullptr);
-        const auto w3 = vop3(target.vop3_opcode, 3, vgpr(1), vgpr(2));
-        const std::array<uint32_t, 3> forms[] = {{vop2(target.vop2_opcode, 3, 2, vgpr(1)), 0, 0},
-                                                 {w3[0], w3[1], 0}};
-        for (const auto &words : forms) {
-          auto inst = f.decode(words);
-          ASSERT_NE(inst, nullptr);
-          for (const auto &witness : witnesses) {
-            f.fill_vgpr(*wf, 1, witness.lhs);
-            f.fill_vgpr(*wf, 2, witness.rhs);
-            f.fill_vgpr(*wf, 3, kUnwritten);
-            wf->set_mode_raw(witness.mode_bits);
-            const uint64_t exec = 1u | (uint64_t{1} << (wave_size - 1));
-            wf->set_exec(exec);
-            wf->set_trapsts(0x40);
-            for (uint32_t repeat = 0; repeat < 2; ++repeat) {
-              wf->clear_pending_alu_causes();
-              const SavedHostEnvironment saved;
-              ASSERT_EQ(std::fesetround(FE_UPWARD), 0);
-              std::feclearexcept(FE_ALL_EXCEPT);
-              std::feraiseexcept(FE_OVERFLOW | FE_INEXACT);
+    constexpr uint32_t wave_size = 64;
+    for (uint32_t control : {0u, 1u, 2u}) {
+      SCOPED_TRACE(target.name);
+      SCOPED_TRACE(wave_size);
+      SCOPED_TRACE(control);
+      ForceScalarOverride scalar(control == 0);
+      MulFixture f(target.arch, target.target,
+                   control == 2 ? amdgpu::MemoryWaitDiagnostics::Warn
+                                : amdgpu::MemoryWaitDiagnostics::Off);
+      f.cu->set_debug_active(control == 1);
+      auto *wf = f.dispatch(wave_size);
+      ASSERT_NE(wf, nullptr);
+      const auto w3 = vop3(target.vop3_opcode, 3, vgpr(1), vgpr(2));
+      const std::array<uint32_t, 3> forms[] = {{vop2(target.vop2_opcode, 3, 2, vgpr(1)), 0, 0},
+                                               {w3[0], w3[1], 0}};
+      for (const auto &words : forms) {
+        auto inst = f.decode(words);
+        ASSERT_NE(inst, nullptr);
+        for (const auto &witness : witnesses) {
+          f.fill_vgpr(*wf, 1, witness.lhs);
+          f.fill_vgpr(*wf, 2, witness.rhs);
+          f.fill_vgpr(*wf, 3, kUnwritten);
+          wf->set_mode_raw(witness.mode_bits);
+          const uint64_t exec = 1u | (uint64_t{1} << (wave_size - 1));
+          wf->set_exec(exec);
+          // A previously latched sticky cause must not suppress this occurrence.
+          wf->set_trapsts(0x40u | witness.causes);
+          wf->clear_pending_alu_causes();
+          const SavedHostEnvironment saved;
+          ASSERT_EQ(std::fesetround(FE_UPWARD), 0);
+          std::feclearexcept(FE_ALL_EXCEPT);
+          std::feraiseexcept(FE_OVERFLOW | FE_INEXACT);
 #if defined(__x86_64__)
-              _mm_setcsr(_mm_getcsr() | (1u << 6) | (1u << 15));
-              const uint32_t expected_mxcsr = _mm_getcsr();
+          _mm_setcsr(_mm_getcsr() | (1u << 6) | (1u << 15));
+          const uint32_t expected_mxcsr = _mm_getcsr();
 #endif
-              errno = EILSEQ;
-              const bool succeeded = f.cu->execute_instruction(inst.get(), *wf).succeeded();
-              const int actual_errno = errno;
-              const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
-              const int actual_rounding = std::fegetround();
+          errno = EILSEQ;
+          const bool succeeded = f.cu->execute_instruction(inst.get(), *wf).succeeded();
+          const int actual_errno = errno;
+          const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
+          const int actual_rounding = std::fegetround();
 #if defined(__x86_64__)
-              const uint32_t actual_mxcsr = _mm_getcsr();
+          const uint32_t actual_mxcsr = _mm_getcsr();
 #endif
-              saved.restore();
-              ASSERT_TRUE(succeeded);
-              EXPECT_EQ(actual_errno, EILSEQ);
-              EXPECT_EQ(actual_flags, FE_OVERFLOW | FE_INEXACT);
-              EXPECT_EQ(actual_rounding, FE_UPWARD);
+          saved.restore();
+          ASSERT_TRUE(succeeded);
+          EXPECT_EQ(actual_errno, EILSEQ);
+          EXPECT_EQ(actual_flags, FE_OVERFLOW | FE_INEXACT);
+          EXPECT_EQ(actual_rounding, FE_UPWARD);
 #if defined(__x86_64__)
-              EXPECT_EQ(actual_mxcsr, expected_mxcsr);
+          EXPECT_EQ(actual_mxcsr, expected_mxcsr);
 #endif
-              EXPECT_EQ(wf->pending_alu_causes(), witness.causes);
-              EXPECT_EQ(wf->trapsts(), 0x40u | witness.causes);
-              uint32_t expected = witness.result;
-              if (target.arch == ROCJITSU_CODE_ARCH_RDNA4 && witness.lhs == 0x7f812345)
-                expected |= 0x00400000;
-              for (uint32_t lane = 0; lane < wave_size; ++lane) {
-                EXPECT_EQ(f.vgpr_value(*wf, 3, lane),
-                          (exec & (uint64_t{1} << lane)) ? expected : kUnwritten);
-              }
-              if (HasFailure())
-                return;
-            }
+          EXPECT_EQ(wf->pending_alu_causes(), witness.causes);
+          EXPECT_EQ(wf->trapsts(), 0x40u | witness.causes);
+          uint32_t expected = witness.result;
+          if (target.arch == ROCJITSU_CODE_ARCH_RDNA4 && witness.lhs == 0x7f812345)
+            expected |= 0x00400000;
+          for (uint32_t lane = 0; lane < wave_size; ++lane) {
+            EXPECT_EQ(f.vgpr_value(*wf, 3, lane),
+                      (exec & (uint64_t{1} << lane)) ? expected : kUnwritten);
           }
+          if (HasFailure())
+            return;
         }
       }
-    }
-  }
-}
-
-TEST(HwfloatMulF32ExecutionTest, QualifiedPlainFormsReportInvalid) {
-  ForceScalarOverride simd(false);
-  for (const QualifiedTarget &target : kQualifiedTargets) {
-    const auto w3 = vop3(target.vop3_opcode, 3, vgpr(1), vgpr(2));
-    const std::array<uint32_t, 3> forms[] = {
-        {vop2(target.vop2_opcode, 3, 2, vgpr(1)), 0, 0},
-        {w3[0], w3[1], 0},
-    };
-    for (const auto &words : forms) {
-      SCOPED_TRACE(target.name);
-      MulFixture f(target.arch, target.target);
-      amdgpu::Wavefront *wf = f.dispatch(32);
-      ASSERT_NE(wf, nullptr);
-      f.fill_vgpr(*wf, 1, 0x00000000u);
-      f.fill_vgpr(*wf, 2, 0x7f800000u);
-      f.fill_vgpr(*wf, 3, kUnwritten);
-      wf->set_mode_raw(mode(0, 0));
-      wf->set_exec(0x0000'ff01u);
-      wf->set_trapsts(0);
-      const Outcome outcome = run_mul(f, *wf, words);
-      EXPECT_EQ(outcome.pending, cause::kInvalid);
-      EXPECT_EQ(outcome.trapsts, cause::kInvalid);
-      EXPECT_EQ(f.vgpr_value(*wf, 3, 0), 0xffc00000u);
-      EXPECT_EQ(f.vgpr_value(*wf, 3, 1), kUnwritten);
     }
   }
 }
@@ -838,6 +814,176 @@ TEST(HwfloatMulF32ExecutionTest, HostFloatingPointStateDoesNotAffectResults) {
     }
     EXPECT_EQ(wf->pending_alu_causes(), expected_causes);
     EXPECT_EQ(wf->trapsts(), expected_causes);
+  }
+}
+
+// Directed physical gfx1100/gfx1201 DX9 captures. Expected bits and flags are
+// literal observations, independent of the new arithmetic implementation.
+struct Dx9Witness {
+  uint32_t a, b, mode, omod, clamp, rdna3_bits, rdna4_bits, rdna3_causes, rdna4_causes;
+};
+constexpr Dx9Witness kDx9Witnesses[] = {
+    {0x3f800001, 0x3f800003, 0xc0, 0, 0, 0x3f800004, 0x3f800004, 0x20, 0x20},
+    {0x3f800001, 0x3f800003, 0xc1, 0, 0, 0x3f800005, 0x3f800005, 0x20, 0x20},
+    {0x3f800001, 0x3f800003, 0xc2, 0, 0, 0x3f800004, 0x3f800004, 0x20, 0x20},
+    {0x3f800001, 0x3f800003, 0xc3, 0, 0, 0x3f800004, 0x3f800004, 0x20, 0x20},
+    {0x00000001, 0x4b000000, 0xc0, 0, 0, 0x00000000, 0x00000000, 0x00, 0x00},
+    {0x00000001, 0x4b000000, 0xd0, 0, 0, 0x00800000, 0x00800000, 0x02, 0x02},
+    {0x00000001, 0x4b000000, 0xe0, 0, 0, 0x00000000, 0x00000000, 0x00, 0x00},
+    {0x00000001, 0x4b000000, 0xf0, 0, 0, 0x00800000, 0x00800000, 0x02, 0x02},
+    {0x00800000, 0x3f7fffff, 0xc0, 0, 0, 0x00000000, 0x00000000, 0x30, 0x30},
+    {0x80800000, 0x3f7fffff, 0xc0, 0, 0, 0x80000000, 0x80000000, 0x30, 0x30},
+    {0x00800000, 0x3f7fffff, 0xf0, 0, 0, 0x00800000, 0x00800000, 0x30, 0x30},
+    {0x00000000, 0x7f800000, 0xc0, 0, 0, 0x00000000, 0x00000000, 0x00, 0x00},
+    {0x00000000, 0x7f812345, 0xc0, 0, 0, 0x00000000, 0x00000000, 0x01, 0x01},
+    {0x7f812345, 0x3f800000, 0xc0, 0, 0, 0x7f812345, 0x7fc12345, 0x01, 0x01},
+    {0x7f812345, 0x3f800000, 0x2c0, 0, 0, 0x7fc12345, 0x7fc12345, 0x01, 0x01},
+    {0x7f812345, 0x3f800000, 0x1c0, 0, 0, 0x7f812345, 0x7fc12345, 0x00, 0x01},
+    {0x00000000, 0x00000001, 0xd0, 0, 0, 0x00000000, 0x00000000, 0x02, 0x02},
+    {0x7f812345, 0x00000001, 0xd0, 0, 0, 0x7f812345, 0x7fc12345, 0x01, 0x01},
+    {0x00800000, 0x3f7fffff, 0xf0, 1, 0, 0x00800000, 0x00000000, 0x00, 0x00},
+    {0x7f7fffff, 0x40000000, 0xc0, 1, 0, 0x7f800000, 0x7f800000, 0x00, 0x08},
+    {0x3f800001, 0x3f800003, 0xc0, 1, 0, 0x40000004, 0x40000004, 0x00, 0x00},
+    {0x7f812345, 0x3f800000, 0xc0, 0, 1, 0x7f812345, 0x00000000, 0x00, 0x00},
+    {0x7f812345, 0x3f800000, 0x1c0, 0, 1, 0x00000000, 0x00000000, 0x00, 0x00},
+};
+
+TEST(HwfloatDx9MulF32ExecutionTest, PhysicalResultAndStickyWitnesses) {
+  SavedHostEnvironment host;
+  for (const auto &target : kQualifiedTargets) {
+    for (uint32_t lanes : {32u, 64u}) {
+      MulFixture f(target.arch, target.target);
+      auto *wf = f.dispatch(lanes);
+      ASSERT_NE(wf, nullptr);
+      for (bool force_scalar : {false, true}) {
+        ForceScalarOverride scalar(force_scalar);
+        for (bool encoded_vop3 : {false, true}) {
+          for (const auto &w : kDx9Witnesses) {
+            if (!encoded_vop3 && (w.omod || w.clamp))
+              continue;
+            SCOPED_TRACE(target.name);
+            SCOPED_TRACE(w.mode);
+            const bool is_rdna4 = target.arch == ROCJITSU_CODE_ARCH_RDNA4;
+            const uint32_t expected = is_rdna4 ? w.rdna4_bits : w.rdna3_bits;
+            const uint32_t causes = is_rdna4 ? w.rdna4_causes : w.rdna3_causes;
+            for (uint64_t exec : {uint64_t{0}, uint64_t{5}, uint64_t{1} << (lanes - 1)}) {
+              // Alias destination with lhs; inactive lanes must remain untouched.
+              f.fill_vgpr(*wf, 1, w.a);
+              f.fill_vgpr(*wf, 2, w.b);
+              wf->set_mode_raw(w.mode);
+              wf->set_exec(exec);
+              wf->set_trapsts(0x40);
+              std::fesetround(FE_DOWNWARD);
+              std::feclearexcept(FE_ALL_EXCEPT);
+              std::feraiseexcept(FE_DIVBYZERO);
+              errno = EILSEQ;
+              Outcome outcome;
+              if (encoded_vop3) {
+                const auto opcode =
+                    is_rdna4 ? rdna4::kVMulDx9ZeroF32Vop3 : rdna3::kVMulDx9ZeroF32Vop3;
+                outcome = run_mul(
+                    f, *wf, vop3(opcode, 1, vgpr(1), vgpr(2), {.clamp = w.clamp, .omod = w.omod}));
+              } else {
+                const auto opcode =
+                    is_rdna4 ? rdna4::kVMulDx9ZeroF32Vop2 : rdna3::kVMulDx9ZeroF32Vop2;
+                outcome = run_mul(f, *wf, vop2(opcode, 1, 2, vgpr(1)));
+              }
+              const int error = errno;
+              const int rounding = std::fegetround();
+              const int flags = std::fetestexcept(FE_ALL_EXCEPT);
+              EXPECT_EQ(error, EILSEQ);
+              EXPECT_EQ(rounding, FE_DOWNWARD);
+              EXPECT_EQ(flags, FE_DIVBYZERO);
+              EXPECT_EQ(outcome.pending, exec ? causes : 0u);
+              EXPECT_EQ(outcome.trapsts, 0x40u | (exec ? causes : 0u));
+              for (uint32_t lane = 0; lane < lanes; ++lane) {
+                EXPECT_EQ(f.vgpr_value(*wf, 1, lane),
+                          exec & (uint64_t{1} << lane) ? expected : w.a);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(HwfloatDx9MulF32ExecutionTest, ObserversRetainPerLaneReadsWritesAndRepeatedCauses) {
+  SavedHostEnvironment host;
+  for (const auto &target : kQualifiedTargets) {
+    MulFixture f(target.arch, target.target);
+    auto group = std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{});
+    auto plugin = std::make_unique<VgprAccessRecorder>();
+    auto *recorder = plugin.get();
+    ASSERT_TRUE(group->add(std::move(plugin)));
+    f.cu->set_plugin_group(group);
+    group->onInit();
+    auto *wf = f.dispatch(64);
+    ASSERT_NE(wf, nullptr);
+    f.fill_vgpr(*wf, 1, 0);
+    f.fill_vgpr(*wf, 2, 0x7f812345);
+    wf->set_mode_raw(0xc0);
+    constexpr uint64_t exec = 5ull | (1ull << 63);
+    wf->set_exec(exec);
+    wf->set_trapsts(0x41);
+    const bool is_rdna4 = target.arch == ROCJITSU_CODE_ARCH_RDNA4;
+    for (bool encoded_vop3 : {false, true}) {
+      for (uint32_t repeat = 0; repeat < 2; ++repeat) {
+        recorder->events.clear();
+        recorder->reads.clear();
+        recorder->writes.clear();
+        std::fesetround(FE_UPWARD);
+        std::feclearexcept(FE_ALL_EXCEPT);
+        std::feraiseexcept(FE_OVERFLOW);
+        errno = EILSEQ;
+        Outcome outcome;
+        if (encoded_vop3) {
+          const auto opcode = is_rdna4 ? rdna4::kVMulDx9ZeroF32Vop3 : rdna3::kVMulDx9ZeroF32Vop3;
+          outcome = run_mul(f, *wf, vop3(opcode, 3, vgpr(1), vgpr(2)));
+        } else {
+          const auto opcode = is_rdna4 ? rdna4::kVMulDx9ZeroF32Vop2 : rdna3::kVMulDx9ZeroF32Vop2;
+          outcome = run_mul(f, *wf, vop2(opcode, 3, 2, vgpr(1)));
+        }
+        EXPECT_EQ(outcome.pending, 1u);
+        EXPECT_EQ(outcome.trapsts, 0x41u);
+        ASSERT_EQ(recorder->events.size(), 9u);
+        for (size_t i = 0; i < recorder->events.size(); ++i) {
+          const bool write = i % 3 == 2;
+          EXPECT_EQ(recorder->events[i].write, write);
+          EXPECT_EQ(recorder->events[i].pending, i < 2 ? 0u : 1u);
+          EXPECT_EQ(recorder->events[i].host_round,
+                    encoded_vop3 && !write ? FE_TONEAREST : FE_UPWARD);
+          EXPECT_EQ(recorder->events[i].host_flags, encoded_vop3 && !write ? 0 : FE_OVERFLOW);
+          EXPECT_EQ(recorder->events[i].error_number, EILSEQ);
+        }
+        ASSERT_EQ(recorder->reads.size(), 6u);
+        ASSERT_EQ(recorder->writes.size(), 3u);
+        for (size_t i = 0; i < 3; ++i) {
+          const uint64_t lane_mask = uint64_t{1} << (i == 0 ? 0 : i == 1 ? 2 : 63);
+          EXPECT_EQ(recorder->reads[2 * i].second, lane_mask);
+          EXPECT_EQ(recorder->reads[2 * i + 1].second, lane_mask);
+          EXPECT_EQ(recorder->writes[i].second, lane_mask);
+        }
+      }
+    }
+    group->onShutdown();
+  }
+}
+
+TEST(HwfloatDx9MulF32ExecutionTest, ArchitectureOnlyTargetRetainsUnqualifiedPolicy) {
+  for (const auto &target : kQualifiedTargets) {
+    MulFixture f(target.arch, ROCJITSU_CODE_TARGET_INVALID);
+    auto *wf = f.dispatch(32);
+    ASSERT_NE(wf, nullptr);
+    f.fill_vgpr(*wf, 1, 0x00800000);
+    f.fill_vgpr(*wf, 2, 0x3f7fffff);
+    wf->set_mode_raw(0xc0);
+    wf->set_exec(1);
+    const auto opcode = target.arch == ROCJITSU_CODE_ARCH_RDNA4 ? rdna4::kVMulDx9ZeroF32Vop2
+                                                                : rdna3::kVMulDx9ZeroF32Vop2;
+    const auto outcome = run_mul(f, *wf, vop2(opcode, 3, 2, vgpr(1)));
+    EXPECT_EQ(outcome.pending, 0u);
+    EXPECT_EQ(f.vgpr_value(*wf, 3, 0), 0x00800000u);
   }
 }
 

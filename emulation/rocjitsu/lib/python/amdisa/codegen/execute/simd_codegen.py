@@ -2638,7 +2638,7 @@ def simd_probe_line(
 def integer_transcendental_probe_line(
     template_name: str, *, true16_vop3: bool = False
 ) -> str | None:
-    """Probe a pure integer mapping before establishing a host FP environment."""
+    """Build the probe for a pure integer transcendental mapping."""
     base, _, form = template_name.rpartition('_')
     transcendental = {
         'v_log_f32': 'Log',

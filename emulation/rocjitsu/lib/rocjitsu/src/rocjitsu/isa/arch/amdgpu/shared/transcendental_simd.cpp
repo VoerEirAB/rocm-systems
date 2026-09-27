@@ -7,6 +7,7 @@
 #include "util/amdgpu_rcp.h"
 #include "util/amdgpu_rsq.h"
 #include "util/amdgpu_trig.h"
+
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -14,8 +15,6 @@
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
-#define SIMD_TARGET __attribute__((target("avx512f,avx512dq,avx512cd,avx2")))
-#define SIMD_INLINE SIMD_TARGET __attribute__((always_inline)) inline
 #endif
 
 namespace rocjitsu::amdgpu::transcendental {
@@ -29,13 +28,29 @@ namespace {
 // Retain the scalar mappings' integer stages and rounding. Coefficient columns
 // are derived from the same authoritative rows for register-table selection.
 using V = __m512i;
-SIMD_INLINE V constant(uint64_t x) { return _mm512_set1_epi64(static_cast<long long>(x)); }
-SIMD_INLINE V add(V a, V b) { return _mm512_add_epi64(a, b); }
-SIMD_INLINE V sub(V a, V b) { return _mm512_sub_epi64(a, b); }
-SIMD_INLINE V mul(V a, V b) { return _mm512_mullo_epi64(a, b); }
-SIMD_INLINE V band(V a, uint64_t b) { return _mm512_and_si512(a, constant(b)); }
-SIMD_INLINE V select(__mmask8 mask, V yes, V no) { return _mm512_mask_blend_epi64(mask, no, yes); }
-template <unsigned Shift> SIMD_INLINE V round_even(V value) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+constant(uint64_t x) {
+  return _mm512_set1_epi64(static_cast<long long>(x));
+}
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V add(V a, V b) {
+  return _mm512_add_epi64(a, b);
+}
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V sub(V a, V b) {
+  return _mm512_sub_epi64(a, b);
+}
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V mul(V a, V b) {
+  return _mm512_mullo_epi64(a, b);
+}
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V band(V a,
+                                                                                    uint64_t b) {
+  return _mm512_and_si512(a, constant(b));
+}
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V select(__mmask8 mask,
+                                                                                      V yes, V no) {
+  return _mm512_mask_blend_epi64(mask, no, yes);
+}
+template <unsigned Shift>
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V round_even(V value) {
   V whole = _mm512_srli_epi64(value, Shift);
   V rest = band(value, (uint64_t{1} << Shift) - 1);
   V half = constant(uint64_t{1} << (Shift - 1));
@@ -56,7 +71,9 @@ template <typename Coefficient, size_t N> constexpr auto columns(const Coefficie
 }
 inline constexpr auto exp_columns = columns(util::detail::exp::coefficients);
 inline constexpr auto log_columns = columns(util::detail::log::coefficients);
-template <bool Logarithm, unsigned Field> SIMD_INLINE V coefficient(V index) {
+template <bool Logarithm, unsigned Field>
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+coefficient(V index) {
   const uint32_t *table;
   if constexpr (Logarithm)
     table = log_columns[Field].data();
@@ -71,13 +88,14 @@ template <bool Logarithm, unsigned Field> SIMD_INLINE V coefficient(V index) {
                     result);
   return result;
 }
-SIMD_INLINE __mmask8 select_exp_range(V bits, V mag) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline __mmask8
+select_exp_range(V bits, V mag) {
   __mmask8 negative = _mm512_cmpneq_epi64_mask(band(bits, 0x80000000), constant(0));
   return (negative & _mm512_cmple_epu64_mask(mag, constant(0x42fc0000))) |
          (~negative & _mm512_cmplt_epu64_mask(mag, constant(0x43000000)));
 }
 
-SIMD_INLINE V exp_normal(V bits) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V exp_normal(V bits) {
   V mag = band(bits, 0x7fffffff);
   V exponent = sub(_mm512_srli_epi64(mag, 23), constant(127));
   V mantissa = _mm512_or_si512(band(mag, 0x7fffff), constant(0x800000));
@@ -107,7 +125,8 @@ SIMD_INLINE V exp_normal(V bits) {
              round_even<13>(sum));
 }
 
-SIMD_INLINE V log_near_one_negative(V bits) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+log_near_one_negative(V bits) {
   // Four-bit normalization and upward magnitude rounding below one.
   V k = sub(constant(0x3f800000), bits);
   __mmask8 upper = _mm512_cmpge_epu64_mask(k, constant(0x20000));
@@ -141,7 +160,8 @@ SIMD_INLINE V log_near_one_negative(V bits) {
       _mm512_or_si512(_mm512_slli_epi64(add(leading, constant(77)), 23), band(mantissa, 0x7fffff)));
 }
 
-SIMD_INLINE V log_near_one_positive(V bits) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+log_near_one_positive(V bits) {
   // Above one, advance the truncated significand even on an exact grid hit.
   V i = sub(bits, constant(0x3f800000));
   __mmask8 middle = _mm512_cmpge_epu64_mask(i, constant(0x10000));
@@ -170,7 +190,8 @@ SIMD_INLINE V log_near_one_positive(V bits) {
                          band(mantissa, 0x7fffff));
 }
 
-SIMD_INLINE V log_ordinary(V bits) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+log_ordinary(V bits) {
   V fraction = band(bits, 0x3ffff);
   V index = band(_mm512_srli_epi64(bits, 18), 31);
   index = select(_mm512_cmpeq_epi64_mask(index, constant(1)) &
@@ -204,14 +225,9 @@ SIMD_INLINE V log_ordinary(V bits) {
 }
 
 template <bool Logarithm>
-SIMD_TARGET __attribute__((noinline)) void batch(const uint32_t *input, uint32_t *output,
-                                                 bool quiet_snan) {
-  constexpr unsigned Width = 8;
-  __m256i packed;
-  if constexpr (Width == 8)
-    packed = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input));
-  else
-    packed = _mm256_zextsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i *>(input)));
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::noinline]] void
+batch(const uint32_t *input, uint32_t *output, bool quiet_snan) {
+  __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input));
   V bits = _mm512_cvtepu32_epi64(packed);
   __mmask8 eligible;
   if constexpr (Logarithm) {
@@ -223,7 +239,6 @@ SIMD_TARGET __attribute__((noinline)) void batch(const uint32_t *input, uint32_t
     V mag = band(bits, 0x7fffffff);
     eligible = _mm512_cmpge_epu64_mask(mag, constant(0x33800000)) & select_exp_range(bits, mag);
   }
-  eligible &= Width == 4 ? 0x0f : 0xff;
   V magnitude = band(bits, 0x7fffffff);
   __mmask8 negative = _mm512_cmpneq_epi64_mask(band(bits, 0x80000000), constant(0));
   V result;
@@ -261,10 +276,7 @@ SIMD_TARGET __attribute__((noinline)) void batch(const uint32_t *input, uint32_t
           select(above, log_near_one_positive(select(above, bits, constant(0x3f800001))), result);
   }
   __m256i narrowed = _mm512_cvtepi64_epi32(result);
-  if constexpr (Width == 8)
-    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), narrowed);
-  else
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(output), _mm256_castsi256_si128(narrowed));
+  _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), narrowed);
 }
 
 inline constexpr auto trig_columns = [] {
@@ -278,13 +290,16 @@ inline constexpr auto trig_columns = [] {
   }
   return result;
 }();
-template <unsigned Field> SIMD_INLINE V signed_coefficient(V index) {
+template <unsigned Field>
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+signed_coefficient(V index) {
   auto indices = _mm512_zextsi256_si512(_mm512_cvtepi64_epi32(index));
   auto values = _mm512_permutex2var_epi32(_mm512_loadu_si512(trig_columns[Field].data()), indices,
                                           _mm512_loadu_si512(trig_columns[Field].data() + 16));
   return _mm512_cvtepi32_epi64(_mm512_castsi512_si256(values));
 }
-SIMD_INLINE V round_variable(V value, V shift) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+round_variable(V value, V shift) {
   V whole = _mm512_srlv_epi64(value, shift);
   V rest = _mm512_and_si512(value, sub(_mm512_sllv_epi64(constant(1), shift), constant(1)));
   V half = _mm512_sllv_epi64(constant(1), sub(shift, constant(1)));
@@ -293,7 +308,8 @@ SIMD_INLINE V round_variable(V value, V shift) {
       (_mm512_cmpeq_epi64_mask(rest, half) & _mm512_cmpneq_epi64_mask(band(whole, 1), constant(0)));
   return _mm512_mask_add_epi64(whole, increment, whole, constant(1));
 }
-SIMD_INLINE V ordinary_trig(V bits, bool cosine, __mmask8 &eligible) {
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+ordinary_trig(V bits, bool cosine, __mmask8 &eligible) {
   // Reduction is in turns; normalized sine intervals retain extra product bits.
   V magnitude = band(bits, 0x7fffffff);
   eligible = _mm512_cmpge_epu64_mask(magnitude, constant(cosine ? 0x00800000 : 0x39c00000)) &
@@ -401,14 +417,9 @@ SIMD_INLINE V ordinary_trig(V bits, bool cosine, __mmask8 &eligible) {
   return _mm512_or_si512(result, _mm512_slli_epi64(negative, 31));
 }
 template <bool Cosine>
-SIMD_TARGET __attribute__((noinline)) void trig_batch(const uint32_t *input, uint32_t *output,
-                                                      unsigned denorm, bool quiet_snan) {
-  constexpr unsigned Width = 8;
-  __m256i packed;
-  if constexpr (Width == 8)
-    packed = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input));
-  else
-    packed = _mm256_zextsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i *>(input)));
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::noinline]] void
+trig_batch(const uint32_t *input, uint32_t *output, unsigned denorm, bool quiet_snan) {
+  __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(input));
   V bits = _mm512_cvtepu32_epi64(packed), magnitude = band(bits, 0x7fffffff);
   V sign = band(bits, 0x80000000);
   V result = constant(Cosine ? 0x3f800000 : 0);
@@ -455,10 +466,7 @@ SIMD_TARGET __attribute__((noinline)) void trig_batch(const uint32_t *input, uin
   result = select(_mm512_cmpgt_epu64_mask(magnitude, constant(0x7f800000)),
                   _mm512_or_si512(bits, constant(quiet_snan ? 0x00400000 : 0)), result);
   __m256i narrowed = _mm512_cvtepi64_epi32(result);
-  if constexpr (Width == 8)
-    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), narrowed);
-  else
-    _mm_storeu_si128(reinterpret_cast<__m128i *>(output), _mm256_castsi256_si128(narrowed));
+  _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), narrowed);
 }
 
 #endif
@@ -523,8 +531,3 @@ void evaluate_f32_simd(F32Operation operation, const uint32_t *input, uint32_t *
     output[i] = scalar(operation, input[i], denorm, quiet_snan);
 }
 } // namespace rocjitsu::amdgpu::transcendental
-
-#if defined(SIMD_TARGET)
-#undef SIMD_INLINE
-#undef SIMD_TARGET
-#endif

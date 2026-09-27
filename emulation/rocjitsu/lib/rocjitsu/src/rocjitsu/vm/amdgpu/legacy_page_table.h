@@ -114,7 +114,7 @@ private:
   // Reads dominate mutations. Keep the generation off the counters' cache
   // lines, and let unrelated simulation threads admit independently. Hash
   // collisions preserve exclusion, including nested reads on one thread.
-  static constexpr size_t kReaderShards = 128;
+  static constexpr std::size_t kReaderShards = 128;
   struct alignas(64) ReaderShard {
     std::atomic<uint64_t> count{0};
   };
