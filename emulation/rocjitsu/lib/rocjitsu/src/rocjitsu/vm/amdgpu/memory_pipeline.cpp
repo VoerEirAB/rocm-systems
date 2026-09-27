@@ -1004,8 +1004,8 @@ template <bool IncludeClearBlocks = false>
 std::optional<std::array<VmRamRange, 2>> image_metadata_ram_ranges(const VectorMemState &d) {
   const auto &image = *d.image_metadata;
   const uint32_t bytes = d.elem_size;
-  if (!image.width || !image.height || image.width > 4096 || image.height > 4096 || !d.wf_size ||
-      d.wf_size > 64 ||
+  if (image.mip_levels != 1 || !image.width || !image.height || image.width > 4096 ||
+      image.height > 4096 || !d.wf_size || d.wf_size > 64 ||
       (image.depth ? (bytes != 4 || (image.swizzle != 24 && image.swizzle != 28))
                    : (!std::has_single_bit(bytes) || bytes > 16 ||
                       (image.swizzle != 27 && image.swizzle != 31))))
@@ -1086,6 +1086,7 @@ const char *transfer_image_metadata(const Memory &memory, VectorMemState &d) {
   const auto &image = *d.image_metadata;
   const uint32_t tap_count = d.image_sample ? d.image_sample->tap_count : 1;
   const size_t tap_bytes = d.wf_size * d.elem_size;
+  std::array<std::optional<Gfx11DccMipLayout>, 16> mip_layouts{};
   image_metadata_detail::MetadataAddressCache address_cache(
       image.metadata, image.width, image.height, d.elem_size, image.swizzle, image.depth,
       image.pipe_aligned);
@@ -1100,6 +1101,22 @@ const char *transfer_image_metadata(const Memory &memory, VectorMemState &d) {
       const uint32_t x = coordinates[lane] & 0xffff;
       const uint32_t y = coordinates[lane] >> 16;
       const char *error = [&]() {
+        if (image.mip_levels > 1) {
+          const uint32_t level = d.image_sample ? image.tap_levels[tap][lane] : image.levels[lane];
+          if (image.depth || level >= mip_layouts.size())
+            return "unsupported GFX11 metadata mip level";
+          auto &mip = mip_layouts[level];
+          if (!mip)
+            mip = gfx11_dcc_mip_layout(image.swizzle, d.elem_size, image.width, image.height,
+                                       image.mip_levels, level, image.pipe_aligned);
+          if (!mip)
+            return "unsupported GFX11 DCC mip layout";
+          const uint32_t layer =
+              d.image_sample ? d.image_sample->taps[tap].layers[lane] : image.layers[lane];
+          return image_metadata_detail::materialize_gfx11_dcc_mip(
+              memory, image.base, image.metadata, x, y, d.elem_size, image.swizzle,
+              image.pipe_aligned, layer, *mip);
+        }
         if constexpr (CacheAddress) {
           if (memory.has_ram()) {
             const uint32_t layer = image.depth      ? 0

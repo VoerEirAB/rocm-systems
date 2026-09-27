@@ -153,6 +153,10 @@ struct ImageMetadataAccess {
   uint32_t width = 0, height = 0, swizzle = 0;
   bool pipe_aligned = true;
   bool depth = false;
+  uint32_t mip_levels = 1;
+  /// Absolute mip selected by each lane, or by each filter tap when sampling.
+  std::array<uint8_t, 64> levels{};
+  std::vector<std::array<uint8_t, 64>> tap_levels;
   /// Per-lane x in bits 0-15 and y in bits 16-31.
   std::array<uint32_t, 64> coordinates{};
   /// Per-lane absolute array layer, including the descriptor view start.

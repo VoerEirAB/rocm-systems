@@ -89,7 +89,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       (!is_array && (r[4] >> 16)) || (!query && !bytes) ||
       (is_array && (first_layer > last_layer || (r[4] & (gfx12 ? 0xc000c000u : 0xe000e000u)))) ||
       first_level > last_level || last_level > max_level ||
-      (!query && max_level && ((!is_array && r[4]) || compressed)) || (!d.is_load && d.image_srgb))
+      (!query && max_level && !is_array && r[4]) || (!d.is_load && d.image_srgb))
     return unsupported();
   if (dim == 3 && (type != 11 || width != height || first_layer % 6 || last_layer < first_layer ||
                    last_layer - first_layer < 5))
@@ -236,17 +236,18 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const uint32_t pitch = type == 9 && swizzle == 0 && pitch_field ? pitch_field + 1 : mip->pitch;
   if (compressed && !query) {
     const bool depth = swizzle == 24 || swizzle == 28;
-    if ((type != 9 && type != 13) || (depth && type == 13) || max_level ||
+    if ((type != 9 && type != 13) || (depth && (type == 13 || max_level)) ||
         (depth ? (bytes != 1 && bytes != 2 && bytes != 4) : (swizzle != 27 && swizzle != 31)))
       return unsupported();
     d.image_metadata = std::make_unique<ImageMetadataAccess>();
     auto &image = *d.image_metadata;
-    image.base = base;
+    image.base = base - mip->offset;
     image.slice_size = mip->slice_size;
     image.metadata =
         addr_calc::buffer_virtual_address((uint64_t{r[7]} << 16) | (uint64_t{r[6] >> 24} << 8));
-    image.width = width;
-    image.height = height;
+    image.width = resource_width;
+    image.height = resource_height;
+    image.mip_levels = max_level + 1;
     image.swizzle = swizzle;
     image.pipe_aligned = r[6] & (1u << 19);
     image.depth = depth;
@@ -483,6 +484,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         if (access.tap_count > ImageSampleAccess::kMaxTaps)
           return unsupported();
         access.taps.resize(access.tap_count);
+        if (d.image_metadata && max_level)
+          d.image_metadata->tap_levels.resize(access.tap_count);
         double sample_u = 0, sample_v = 0, x0 = 0, y0 = 0;
         for (uint32_t tap = 0; tap < filter_count * access.taps_per_filter; ++tap) {
           const uint32_t filter_index = tap / access.taps_per_filter;
@@ -565,6 +568,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
           access.taps[tap].addresses[lane] = *address;
           access.taps[tap].coordinates[lane] = *tx | (*ty << 16);
           access.taps[tap].layers[lane] = selected_layer;
+          if (d.image_metadata && max_level)
+            d.image_metadata->tap_levels[tap][lane] = std::min(level + mip_index, last_level);
           access.taps[tap].lane_mask |= uint64_t{1} << lane;
         }
         d.per_lane_addr[lane] = access.taps[0].addresses[lane];
@@ -585,8 +590,11 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       if (!address)
         return unsupported();
       d.per_lane_addr[lane] = *address;
-      if (d.image_metadata)
+      if (d.image_metadata) {
         d.image_metadata->coordinates[lane] = x | (y << 16);
+        d.image_metadata->layers[lane] = layer;
+        d.image_metadata->levels[lane] = level;
+      }
       d.lane_mask |= uint64_t{1} << lane;
       continue;
     }
@@ -610,6 +618,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     if (d.image_metadata) {
       d.image_metadata->coordinates[lane] = x | (y << 16);
       d.image_metadata->layers[lane] = layer;
+      d.image_metadata->levels[lane] = first_level;
     }
     d.lane_mask |= uint64_t{1} << lane;
   }

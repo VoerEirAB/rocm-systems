@@ -124,6 +124,44 @@ inline std::optional<uint64_t> gfx11_metadata_address(uint64_t base, uint32_t x,
   return (base & ~mask) + (block << block_log2) + (offset ^ (base & mask));
 }
 
+/// GFX11 DCC allocates a metadata block for the first packed mip and then
+/// whole metadata blocks for each larger mip, in reverse level order. Later
+/// tail levels cannot use DCC (PAL Image::CanMipSupportMetaData).
+struct Gfx11DccMipLayout {
+  ImageMipLayout pixels;
+  uint64_t offset = 0, slice_size = 0;
+  uint32_t width = 0, height = 0;
+  bool enabled = false;
+};
+
+inline std::optional<Gfx11DccMipLayout> gfx11_dcc_mip_layout(uint32_t swizzle, uint32_t bytes,
+                                                             uint32_t width, uint32_t height,
+                                                             uint32_t levels, uint32_t level,
+                                                             bool pipe_aligned) {
+  if (swizzle != 27 && swizzle != 31)
+    return std::nullopt;
+  const auto pixels = image_mip_layout(false, swizzle, bytes, width, height, levels, level);
+  if (!pixels)
+    return std::nullopt;
+  const uint32_t block_log2 = pipe_aligned ? 14 : 12;
+  const uint32_t bits = block_log2 + 8 - std::countr_zero(bytes);
+  const uint32_t bw = 1u << ((bits + 1) / 2), bh = 1u << (bits / 2);
+  const auto extent = [](uint32_t size, uint32_t mip) { return (size + (1u << mip) - 1) >> mip; };
+  Gfx11DccMipLayout result{.pixels = *pixels,
+                           .width = extent(width, level),
+                           .height = extent(height, level),
+                           .enabled = level <= pixels->first_tail};
+  result.slice_size = pixels->first_tail < levels ? uint64_t{1} << block_log2 : 0;
+  for (uint32_t mip = pixels->first_tail; mip-- > 0;) {
+    if (mip == level)
+      result.offset = result.slice_size;
+    result.slice_size +=
+        uint64_t{(extent(width, mip) + bw - 1) / bw} * ((extent(height, mip) + bh - 1) / bh)
+        << block_log2;
+  }
+  return result;
+}
+
 inline void read_image_bytes(const GpuVmAccess &memory, uint64_t address,
                              std::span<uint8_t> bytes) {
   if (memory.read(address, std::as_writable_bytes(bytes)) != VmAccessOutcome::Complete)
@@ -287,10 +325,13 @@ private:
 /// encoding. General delta compression is never produced by the functional
 /// renderer.
 template <typename Memory>
-const char *materialize_gfx11_dcc_at_address(const Memory &memory, uint64_t base, uint64_t address,
-                                             uint32_t x, uint32_t y, uint32_t width,
-                                             uint32_t height, uint32_t bytes, uint32_t swizzle,
-                                             uint32_t layer = 0, uint64_t slice_size = 0) {
+const char *
+materialize_gfx11_dcc_at_address(const Memory &memory, uint64_t base, uint64_t address, uint32_t x,
+                                 uint32_t y, uint32_t width, uint32_t height, uint32_t bytes,
+                                 uint32_t swizzle, uint32_t layer = 0, uint64_t slice_size = 0,
+                                 uint32_t pitch = 0, uint32_t tail_x = 0, uint32_t tail_y = 0) {
+  if (!pitch)
+    pitch = width;
   base = image_layer_base(false, base, slice_size, layer, bytes, swizzle);
   uint8_t key;
   if (memory.read(address, std::as_writable_bytes(std::span{&key, 1})) != VmAccessOutcome::Complete)
@@ -303,7 +344,7 @@ const char *materialize_gfx11_dcc_at_address(const Memory &memory, uint64_t base
   y &= ~(bh - 1);
   std::array<uint8_t, 16> value{};
   if (key == 1) {
-    const auto clear = gfx11_image_address(base, x, y, width, bytes, swizzle);
+    const auto clear = gfx11_image_address(base, x + tail_x, y + tail_y, pitch, bytes, swizzle);
     if (!clear)
       return "unsupported GFX11 DCC clear layout";
     if (memory.read(*clear, std::as_writable_bytes(std::span{value}.first(bytes))) !=
@@ -329,7 +370,7 @@ const char *materialize_gfx11_dcc_at_address(const Memory &memory, uint64_t base
   }
   for (uint32_t py = y; py < std::min(y + bh, height); ++py)
     for (uint32_t px = x; px < std::min(x + bw, width); ++px)
-      if (memory.write(*gfx11_image_address(base, px, py, width, bytes, swizzle),
+      if (memory.write(*gfx11_image_address(base, px + tail_x, py + tail_y, pitch, bytes, swizzle),
                        std::as_bytes(std::span{value}.first(bytes))) != VmAccessOutcome::Complete)
         return "image write failed";
   key = 0xff;
@@ -349,6 +390,28 @@ const char *materialize_gfx11_dcc(const Memory &memory, uint64_t base, uint64_t 
     return "unsupported GFX11 DCC surface layout";
   return materialize_gfx11_dcc_at_address(memory, base, *address, x, y, width, height, bytes,
                                           swizzle, layer, slice_size);
+}
+
+/// Materialize a selected mip without touching adjacent levels or array slices.
+template <typename Memory>
+const char *materialize_gfx11_dcc_mip(const Memory &memory, uint64_t base, uint64_t metadata,
+                                      uint32_t x, uint32_t y, uint32_t bytes, uint32_t swizzle,
+                                      bool pipe_aligned, uint32_t layer,
+                                      const Gfx11DccMipLayout &mip) {
+  if (!mip.enabled)
+    return nullptr;
+  const uint32_t metadata_mask = (1u << (pipe_aligned ? 14 : 12)) - 1;
+  metadata += mip.offset + layer * mip.slice_size;
+  if (pipe_aligned)
+    metadata ^= gfx11_image_slice_xor(layer, bytes, swizzle) & metadata_mask;
+  const auto address = gfx11_metadata_address(metadata, x, y, mip.width, mip.height, bytes, swizzle,
+                                              false, pipe_aligned);
+  if (!address)
+    return "unsupported GFX11 DCC mip layout";
+  const auto &pixels = mip.pixels;
+  return materialize_gfx11_dcc_at_address(
+      memory, base + pixels.offset, *address, x, y, pixels.width, pixels.height, bytes, swizzle,
+      layer, pixels.slice_size, pixels.pitch, pixels.tail_x, pixels.tail_y);
 }
 
 /// HTILE ZMask zero references DB_DEPTH_CLEAR; ZMask fifteen is uncompressed.

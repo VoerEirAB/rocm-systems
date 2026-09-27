@@ -115,6 +115,7 @@ private:
     uint64_t base = 0, slice_size = 0;
     uint32_t first_layer = 0, last_layer = 0;
     uint32_t max_mip = 0, mip = 0;
+    uint32_t resource_width = 0, resource_height = 0;
     uint32_t pitch = 0, tail_x = 0, tail_y = 0;
     uint32_t write_mask = 0, blend = 0;
     std::array<uint32_t, 4> component_indices{0, 1, 2, 3};

@@ -1248,8 +1248,10 @@ void GraphicsDraw::prepare_colors() {
     color.pipe_aligned = attrib3 & (1u << 30);
     const auto mip = image_mip_layout(gfx12, color.swizzle, color.bytes, (attrib2 >> 16) + 1,
                                       (attrib2 & 0xffff) + 1, color.max_mip + 1, color.mip);
-    if (!mip || (color.metadata && color.max_mip))
+    if (!mip)
       throw std::runtime_error("unsupported graphics color mip layout");
+    color.resource_width = (attrib2 >> 16) + 1;
+    color.resource_height = (attrib2 & 0xffff) + 1;
     color.width = mip->width;
     color.height = mip->height;
     if (width_ && (width_ != color.width || height_ != color.height))
@@ -2099,6 +2101,22 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       const uint32_t block_bits = 8 - std::countr_zero(color.bytes);
       const uint32_t block_width = 1u << ((block_bits + 1) / 2);
       const uint32_t block_height = 1u << (block_bits / 2);
+      if (color.max_mip) {
+        const auto mip = gfx11_dcc_mip_layout(color.swizzle, color.bytes, color.resource_width,
+                                              color.resource_height, color.max_mip + 1, color.mip,
+                                              color.pipe_aligned);
+        if (!mip)
+          throw std::runtime_error("unsupported graphics DCC mip layout");
+        if (mip->enabled)
+          for (uint32_t layer = color.first_layer; layer <= color.last_layer; ++layer)
+            for (uint32_t y = 0; y < color.height; y += block_height)
+              for (uint32_t x = 0; x < color.width; x += block_width)
+                if (const char *error = image_metadata_detail::materialize_gfx11_dcc_mip(
+                        memory, color.base - mip->pixels.offset, *color.metadata, x, y, color.bytes,
+                        color.swizzle, color.pipe_aligned, layer, *mip))
+                  throw std::runtime_error(error);
+        continue;
+      }
       for (uint32_t layer = color.first_layer; layer <= color.last_layer; ++layer) {
         if (allow_ram_read_batching &&
             try_gfx11_expanded_dcc(memory, *color.metadata, color.width, color.height, color.bytes,

@@ -314,11 +314,9 @@ SIMD_VOP2_BINARY: dict[str, tuple[str, str]] = {
 #   un_op(simd<Tin>) -> simd<Tout>
 # inside try_execute_unary_vop1_simd. Tin and Tout are both 32-bit lane
 # types and may differ (e.g. int32->float32 for v_cvt_f32_i32). Eligible
-# kernels are those whose host SIMD result is bit-identical to the scalar
-# generated body: elementwise bit ops, exact int<->float casts, and the
-# correctly-rounded IEEE operations (div, sqrt, and — verified per toolchain
-# via the parity test — exp2/log2). NaN/clamp-bearing conversions and the
-# inexact transcendentals (sin/cos) are excluded.
+# kernels preserve the generated scalar result: elementwise bit operations,
+# exact casts, and floating-point helpers with matching guest policies.
+# LOG/EXP and RCP/RSQ use the shared hardware mappings. SIN/COS stay scalar.
 # VOP1 base mnemonics whose VOP3 form applies float abs/neg/omod/clamp modifiers
 # over an f32 source and result (so the VOP3 twin routes through the f32 unary
 # modifier glue rather than reusing the plain VOP1 path).
@@ -2020,13 +2018,10 @@ SIMD_VOP3_UNARY_FP64: dict[str, str] = {
 }
 
 
-# VOP3 f16 unary: widen f16->f32, apply abs/neg, op, omod/clamp, narrow back.
-# Rounding ops (ceil/floor/trunc/rndne) have no FTZ. sqrt is also no-FTZ
-# (transcendental::sqrt_f32 keeps denormals). The remaining transcendentals
-# (rcp/exp/log) reuse util::*_f32_simd which already wraps the scalar
-# transcendental::flush_denorm_f32 carve-outs (FTZ input + matching ±0/Inf
-# blends + NaN-passthrough), so the f16 scalar
-# f32_to_f16(transcendental::op_f32(f16_to_f32(...))) maps directly.
+# VOP3 f16 unary operations widen to f32 for modifiers and narrow the result.
+# Rounding and SQRT preserve input denormals; RCP uses the f32 helper.
+# RSQ applies half denormal policy. LOG/EXP use log_exp_f16_simd to apply
+# half denormal, overflow and NaN policies and round to f16 before OMOD.
 SIMD_VOP3_UNARY_FP16: dict[str, str] = {
     'v_ceil_f16_vop3': '[](auto a) { return util::ceil_simd(a); }',
     'v_floor_f16_vop3': '[](auto a) { return util::floor_simd(a); }',

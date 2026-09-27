@@ -280,6 +280,7 @@ struct ImageMipLayout {
   uint64_t offset = 0, slice_size = 0;
   uint32_t width = 0, height = 0, pitch = 0;
   uint32_t tail_x = 0, tail_y = 0;
+  uint32_t first_tail = 1;
 };
 
 /// Single-sample 2D mip allocation for the layouts supported above. The offset
@@ -328,6 +329,7 @@ inline std::optional<ImageMipLayout> image_mip_layout(bool gfx12, uint32_t swizz
       break;
     }
   }
+  out.first_tail = first_tail;
   out.slice_size = first_tail < levels ? uint64_t{1} << block_log2 : 0;
   for (uint32_t mip = 0; mip < first_tail; ++mip)
     out.slice_size += uint64_t{align(allocation_extent(width, mip), block_width)} *

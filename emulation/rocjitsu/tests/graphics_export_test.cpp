@@ -5355,6 +5355,65 @@ TEST_P(GraphicsExportTest, CompressedImageTransfersMaterializeClearsAndPreserveS
     }
 }
 
+TEST_P(GraphicsExportTest, CompressedMipSamplingKeepsLaneLodsAndArrayLayersSeparate) {
+  if (GetParam() == ROCJITSU_CODE_ARCH_RDNA4)
+    GTEST_SKIP() << "GFX12 metadata is allocation-managed";
+  constexpr uint64_t base = 0x400000, metadata = 0x200000;
+  // AddrLib: five 512x512 RGBA8 R_X mips occupy 1441792 bytes per
+  // layer, with 65536 metadata bytes. Mip 3 starts the packed tail.
+  const std::array<uint32_t, 8> descriptor{base >> 8,
+                                           (42u << 20) | (4u << 16) | (3u << 30),
+                                           127u | (511u << 14),
+                                           (13u << 28) | (27u << 20) | (4u << 16) | 0xfac,
+                                           (2u << 16) | 4,
+                                           0,
+                                           (1u << 21) | (1u << 19),
+                                           metadata >> 16};
+  for (uint32_t i = 0; i < descriptor.size(); ++i)
+    wave_->debug_write_sgpr(8 + i, descriptor[i]);
+  wave_->debug_write_sgpr(4, 2 | (2 << 3) | (2 << 6));
+  wave_->debug_write_sgpr(5, 4u << 20); // Maximum LOD = 4.
+  wave_->debug_write_sgpr(7, 0);
+  wave_->set_exec(3);
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    wave_->debug_write_vgpr(2, lane, 0);
+    wave_->debug_write_vgpr(3, lane, 0);
+    wave_->debug_write_vgpr(4, lane, std::bit_cast<uint32_t>(1.0f)); // View-relative layer.
+    wave_->debug_write_vgpr(5, lane, std::bit_cast<uint32_t>(2.5f + lane));
+  }
+  constexpr uint64_t layer_base = base + 3 * 1441792 + 0x600;
+  constexpr uint64_t tag2 = metadata + 3 * 65536 + 16384 + 0x600;
+  constexpr uint64_t tag3 = metadata + 3 * 65536 + 0x600;
+  constexpr uint64_t other_layer_tag = metadata + 2 * 65536 + 0x200;
+  for (bool trilinear : {false, true}) {
+    memory_.write8(tag2, 8); // Black, opaque.
+    memory_.write8(tag3, 2); // White, opaque.
+    memory_.write8(other_layer_tag, 0);
+    // Mip 4 has no DCC, despite the descriptor's compression-enable bit.
+    memory_.write32(*amdgpu::gfx11_image_address(layer_base, 0, 64, 128, 4, 27), 0);
+    wave_->debug_write_sgpr(6, (trilinear ? 2u : 1u) << 26);
+    const auto encoding = rdna3::build_mimg(
+        29, {.dim = 5, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2, .ssamp = 1});
+    std::array<uint32_t, 4> words{};
+    std::copy(encoding.begin(), encoding.end(), words.begin());
+    auto decoded = decoder_->decode(words.data());
+    ASSERT_FALSE(decoded.failed());
+    auto instruction = std::move(decoded).value();
+    ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
+    ASSERT_FALSE(wave_->instruction_execution_failed());
+    amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+    pipeline.issue(instruction.release(), *wave_);
+    ASSERT_FALSE(wave_->instruction_execution_failed());
+    for (uint32_t c = 0; c < 4; ++c) {
+      EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0), !trilinear || c == 3 ? 0x3f800000u : 0x3f000000u);
+      EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 1), trilinear ? 0x3f000000u : 0u);
+    }
+    EXPECT_EQ(memory_.read8(tag3), 255);
+    EXPECT_EQ(memory_.read8(tag2), trilinear ? 255 : 8);
+    EXPECT_EQ(memory_.read8(other_layer_tag), 0);
+  }
+}
+
 TEST_P(GraphicsExportTest, UnsupportedComparisonSamplingReportsAnExecutionError) {
   std::array<uint32_t, 4> words{};
   if (GetParam() == ROCJITSU_CODE_ARCH_RDNA4) {
@@ -5479,68 +5538,98 @@ TEST_P(GraphicsExportTest, ImageStoreMasksFillOmittedChannelsAtBothDataWidths) {
 TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOffsets) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
   constexpr uint32_t base = 0x400000;
-  for (uint32_t level = 0; level < 8; ++level) {
-    SCOPED_TRACE(level);
-    const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
-    std::array<uint32_t, 8> descriptor{base >> 8,
-                                       (46u << (gfx12 ? 17 : 20)) | (3u << 30) |
-                                           (7u << (gfx12 ? 12 : 16)),
-                                       49u | (179u << 14),
-                                       (9u << 28) | ((gfx12 ? 3u : 27u) << 20) | 0xfac,
-                                       0,
-                                       0,
-                                       0,
-                                       0};
-    if (gfx12) {
-      descriptor[1] |= level << 25;
-      descriptor[3] |= 7u << 15;
-    } else {
-      descriptor[3] |= (level << 12) | (7u << 16);
-    }
-    for (uint32_t r = 0; r < descriptor.size(); ++r)
-      wave_->debug_write_sgpr(8 + r, descriptor[r]);
-    wave_->set_exec(15);
-    for (uint32_t lane = 0; lane < 4; ++lane) {
-      wave_->debug_write_vgpr(2, lane, lane == 1 ? width : lane == 3 ? ~0u : width - 1);
-      wave_->debug_write_vgpr(3, lane, lane == 2 ? height : height - 1);
-    }
-    const uint32_t address = base + kMipLastTexelOffsets[gfx12][level];
-    memory_.write32(address, 0x44332211);
-    amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
-    for (bool store : {false, true}) {
-      std::array<uint32_t, 4> words{};
+  for (bool compressed : {false, true}) {
+    if (gfx12 && compressed)
+      continue;
+    for (uint32_t level = 0; level < 8; ++level) {
+      SCOPED_TRACE(level);
+      const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
+      std::array<uint32_t, 8> descriptor{base >> 8,
+                                         (46u << (gfx12 ? 17 : 20)) | (3u << 30) |
+                                             (7u << (gfx12 ? 12 : 16)),
+                                         49u | (179u << 14),
+                                         (9u << 28) | ((gfx12 ? 3u : 27u) << 20) | 0xfac,
+                                         0,
+                                         0,
+                                         0,
+                                         0};
       if (gfx12) {
-        const auto inst = rdna4::build_vimage(
-            store ? 6 : 0,
-            {.dim = 1, .dmask = 15, .vdata = 8, .rsrc = 8, .vaddr0 = 2, .vaddr1 = 3});
-        std::copy(inst.begin(), inst.end(), words.begin());
+        descriptor[1] |= level << 25;
+        descriptor[3] |= 7u << 15;
       } else {
-        const auto inst = rdna3::build_mimg(
-            store ? 6 : 0, {.dim = 1, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2});
-        std::copy(inst.begin(), inst.end(), words.begin());
+        descriptor[3] |= (level << 12) | (7u << 16);
       }
-      auto decoded = decoder_->decode(words.data());
-      ASSERT_FALSE(decoded.failed());
-      auto instruction = std::move(decoded).value();
-      ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
-      ASSERT_FALSE(wave_->instruction_execution_failed());
-      ASSERT_NE(instruction->data(), nullptr);
-      const auto *transfer = instruction->data_as<amdgpu::VectorMemState>();
-      EXPECT_EQ(transfer->per_lane_addr[0], address);
-      EXPECT_EQ(transfer->lane_mask, 1u);
-      pipeline.issue(instruction.release(), *wave_);
-      if (!store) {
-        for (uint32_t c = 0; c < 4; ++c) {
-          EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0), 0x11u * (c + 1));
-          for (uint32_t lane = 1; lane < 4; ++lane)
-            EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), 0u);
-          wave_->debug_write_vgpr(8 + c, 0, 0x80u + c);
+      constexpr uint64_t metadata = 0x200000;
+      // AddrLib: 200x180 R_X has three DCC blocks; tail levels after mip 2
+      // cannot use metadata. Seed the first byte of every block independently.
+      if (compressed) {
+        descriptor[6] = (1u << 21) | (1u << 19);
+        descriptor[7] = metadata >> 16;
+      }
+      const uint64_t tag = *amdgpu::gfx11_metadata_address(
+          metadata + (2 - std::min(level, 2u)) * 16384, width - 1, height - 1,
+          (200 + (1u << level) - 1) >> level, (180 + (1u << level) - 1) >> level, 4, 27, false);
+      memory_.write8(tag, 2);
+      for (uint32_t r = 0; r < descriptor.size(); ++r)
+        wave_->debug_write_sgpr(8 + r, descriptor[r]);
+      wave_->set_exec(15);
+      for (uint32_t lane = 0; lane < 4; ++lane) {
+        wave_->debug_write_vgpr(2, lane, lane == 1 ? width : lane == 3 ? ~0u : width - 1);
+        wave_->debug_write_vgpr(3, lane, lane == 2 ? height : height - 1);
+      }
+      const uint32_t address = base + kMipLastTexelOffsets[gfx12][level];
+      memory_.write32(address, 0x44332211);
+      amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+      for (bool store : {false, true}) {
+        // The load has expanded this block. Exercise a store directly into a
+        // different compressed clear, including the first packed-tail mip.
+        if (store && compressed && level <= 2)
+          memory_.write8(tag, 8);
+        std::array<uint32_t, 4> words{};
+        if (gfx12) {
+          const auto inst = rdna4::build_vimage(
+              store ? 6 : 0,
+              {.dim = 1, .dmask = 15, .vdata = 8, .rsrc = 8, .vaddr0 = 2, .vaddr1 = 3});
+          std::copy(inst.begin(), inst.end(), words.begin());
+        } else {
+          const auto inst = rdna3::build_mimg(
+              store ? 6 : 0, {.dim = 1, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2});
+          std::copy(inst.begin(), inst.end(), words.begin());
+        }
+        auto decoded = decoder_->decode(words.data());
+        ASSERT_FALSE(decoded.failed());
+        auto instruction = std::move(decoded).value();
+        ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
+        ASSERT_FALSE(wave_->instruction_execution_failed());
+        ASSERT_NE(instruction->data(), nullptr);
+        const auto *transfer = instruction->data_as<amdgpu::VectorMemState>();
+        EXPECT_EQ(transfer->per_lane_addr[0], address);
+        EXPECT_EQ(transfer->lane_mask, 1u);
+        pipeline.issue(instruction.release(), *wave_);
+        if (!store) {
+          for (uint32_t c = 0; c < 4; ++c) {
+            EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0),
+                      compressed && level <= 2 ? 255u : 0x11u * (c + 1));
+            for (uint32_t lane = 1; lane < 4; ++lane)
+              EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), 0u);
+            wave_->debug_write_vgpr(8 + c, 0, 0x80u + c);
+          }
         }
       }
+      cu_->l1_vector().flush_all();
+      cache_.flush_all();
+      EXPECT_EQ(memory_.read32(address), 0x83828180u);
+      if (compressed && level <= 2) {
+        const auto mip = amdgpu::image_mip_layout(false, 27, 4, 200, 180, 8, level);
+        ASSERT_TRUE(mip);
+        const auto neighbor =
+            amdgpu::gfx11_image_address(base + mip->offset, width - 2 + mip->tail_x,
+                                        height - 1 + mip->tail_y, mip->pitch, 4, 27);
+        ASSERT_TRUE(neighbor);
+        EXPECT_EQ(memory_.read32(*neighbor), 0xff000000u);
+      }
+      EXPECT_EQ(memory_.read8(tag), compressed && level <= 2 ? 255 : 2);
     }
-    cu_->l1_vector().flush_all();
-    cache_.flush_all();
-    EXPECT_EQ(memory_.read32(address), 0x83828180u);
   }
 }
 
@@ -6638,38 +6727,54 @@ TEST_P(GraphicsExportTest, MultipleAttachmentViewsClipLayersIndependently) {
 TEST_P(GraphicsExportTest, ColorAttachmentWritesSelectedMipAndPreservesOtherLevels) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
   constexpr uint32_t base = 0x400000;
-  for (uint32_t level = 0; level < 8; ++level) {
-    SCOPED_TRACE(level);
-    const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
-    for (uint32_t offset : kMipLastTexelOffsets[gfx12])
-      memory_.write32(base + offset, 0x12345678);
-    auto state = rectangle_state();
-    auto &context = state.context_registers;
-    context[gfx12 ? 0x3b0 : 0x31c] = 10;
-    context[gfx12 ? 0x31e : 0x3b0] = gfx12 ? 179 | (199 << 16) : 179 | (199 << 14) | (7u << 28);
-    context[gfx12 ? 0x31f : 0x3b8] = gfx12 ? (3u << 15) | (7u << 19) : 27u << 14;
-    context[gfx12 ? 0x31a : 0x31b] = gfx12 ? level : level << 26;
-    context[0x318] = base >> 8;
-    context[gfx12 ? 0x214 : 0x8e] = 15;
-    context[gfx12 ? 0x215 : 0x8f] = 15;
-    context[gfx12 ? 0x195 : 0x1c5] = 4;
-    context[gfx12 ? 0x216 : 0x202] = 0xcc0010;
-    context[0x10f] = context[0x110] = std::bit_cast<uint32_t>(width / 2.0f);
-    context[0x111] = context[0x112] = std::bit_cast<uint32_t>(height / 2.0f);
-    context[0x113] = context[gfx12 ? 0x116 : 0xb5] = std::bit_cast<uint32_t>(1.0f);
-    context[0x90] = (width - 1) | ((height - 1) << 16);
-    context[0x91] = (width - gfx12) | ((height - gfx12) << 16);
+  for (bool compressed : {false, true}) {
+    if (gfx12 && compressed)
+      continue;
+    for (uint32_t level = 0; level < 8; ++level) {
+      SCOPED_TRACE(level);
+      const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
+      for (uint32_t offset : kMipLastTexelOffsets[gfx12])
+        memory_.write32(base + offset, 0x12345678);
+      auto state = rectangle_state();
+      auto &context = state.context_registers;
+      context[gfx12 ? 0x3b0 : 0x31c] = 10;
+      context[gfx12 ? 0x31e : 0x3b0] = gfx12 ? 179 | (199 << 16) : 179 | (199 << 14) | (7u << 28);
+      context[gfx12 ? 0x31f : 0x3b8] = gfx12 ? (3u << 15) | (7u << 19) : 27u << 14;
+      context[gfx12 ? 0x31a : 0x31b] = gfx12 ? level : level << 26;
+      context[0x318] = base >> 8;
+      context[gfx12 ? 0x214 : 0x8e] = 15;
+      context[gfx12 ? 0x215 : 0x8f] = 15;
+      context[gfx12 ? 0x195 : 0x1c5] = 4;
+      context[gfx12 ? 0x216 : 0x202] = 0xcc0010;
+      context[0x10f] = context[0x110] = std::bit_cast<uint32_t>(width / 2.0f);
+      context[0x111] = context[0x112] = std::bit_cast<uint32_t>(height / 2.0f);
+      context[0x113] = context[gfx12 ? 0x116 : 0xb5] = std::bit_cast<uint32_t>(1.0f);
+      context[0x90] = (width - 1) | ((height - 1) << 16);
+      context[0x91] = (width - gfx12) | ((height - gfx12) << 16);
 
-    auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 3);
-    export_rectangle_vertices(*draw);
-    ASSERT_TRUE(draw->advance(*access_));
-    initialize_fragment(draw);
-    for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
-      draw->export_lane(*wave_, lane, 0, 3, {0x00003c00, 0x3c000000, 0, 0});
-    EXPECT_FALSE(draw->advance(*access_));
-    for (uint32_t mip = 0; mip < 8; ++mip)
-      EXPECT_EQ(memory_.read32(base + kMipLastTexelOffsets[gfx12][mip]),
-                mip == level ? 0xff0000ffu : 0x12345678u);
+      constexpr uint64_t metadata = 0x200000;
+      if (compressed) {
+        context[0x31e] |= 1u << 22;
+        context[0x3b8] |= 1u << 30;
+        context[0x325] = metadata >> 8;
+        for (uint32_t i = 0; i < 49152; ++i)
+          memory_.write8(metadata + i, 0);
+      }
+      auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 3);
+      export_rectangle_vertices(*draw);
+      ASSERT_TRUE(draw->advance(*access_));
+      initialize_fragment(draw);
+      for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
+        draw->export_lane(*wave_, lane, 0, 3, {0x00003c00, 0x3c000000, 0, 0});
+      EXPECT_FALSE(draw->advance(*access_));
+      if (compressed) {
+        for (uint32_t mip = 0; mip < 3; ++mip)
+          EXPECT_EQ(memory_.read8(metadata + (2 - mip) * 16384), mip == level ? 255 : 0);
+      }
+      for (uint32_t mip = 0; mip < 8; ++mip)
+        EXPECT_EQ(memory_.read32(base + kMipLastTexelOffsets[gfx12][mip]),
+                  mip == level ? 0xff0000ffu : 0x12345678u);
+    }
   }
 }
 
@@ -8869,6 +8974,36 @@ TEST(GraphicsImageMetadataTest, AddressesMatchAddrLibAcrossMetadataBlocks) {
     EXPECT_EQ(actual, 0x100000 + test.expected)
         << test.swizzle << "," << test.bytes << "," << test.x << "," << test.y;
   }
+}
+
+TEST(GraphicsImageMetadataTest, DccMipLayoutMatchesAddrLib) {
+  struct Case {
+    uint32_t swizzle, bytes, width, height, levels, level;
+    bool pipe_aligned;
+    uint64_t offset, slice_size;
+    uint32_t first_tail;
+  };
+  // Addr2ComputeDccInfo with GB_ADDR_CONFIG=0x545. Include odd storage
+  // extents, multi-block levels, both swizzles and both pipe policies.
+  constexpr Case cases[] = {
+      {27, 4, 512, 512, 5, 0, true, 49152, 65536, 3},
+      {27, 4, 512, 512, 5, 3, true, 0, 65536, 3},
+      {27, 4, 512, 512, 5, 4, true, 0, 65536, 3},
+      {27, 4, 129, 71, 8, 1, true, 16384, 49152, 2},
+      {31, 16, 4093, 3001, 12, 0, true, 327680, 1114112, 6},
+      {27, 8, 4093, 3001, 12, 0, false, 143360, 536576, 6},
+  };
+  for (const auto &c : cases) {
+    const auto mip = amdgpu::gfx11_dcc_mip_layout(c.swizzle, c.bytes, c.width, c.height, c.levels,
+                                                  c.level, c.pipe_aligned);
+    ASSERT_TRUE(mip);
+    EXPECT_EQ(mip->offset, c.offset);
+    EXPECT_EQ(mip->slice_size, c.slice_size);
+    EXPECT_EQ(mip->pixels.first_tail, c.first_tail);
+    EXPECT_EQ(mip->enabled, c.level <= c.first_tail);
+  }
+  EXPECT_FALSE(amdgpu::gfx11_dcc_mip_layout(24, 4, 512, 512, 5, 0, true));
+  EXPECT_FALSE(amdgpu::gfx11_dcc_mip_layout(27, 3, 512, 512, 5, 0, true));
 }
 
 TEST(GraphicsImageMetadataTest, DccClearsPreserveNeighborBlocksAndLaterWrites) {
