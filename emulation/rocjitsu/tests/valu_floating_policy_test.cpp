@@ -281,7 +281,32 @@ std::array<uint32_t, 1> unary_words(rj_code_arch_t arch, size_t op) {
     return {};
   }
 }
-
+std::array<uint32_t, 2> rsq_f16_vop3_words(rj_code_arch_t arch) {
+  switch (arch) {
+  case ROCJITSU_CODE_ARCH_CDNA1:
+    return cdna1::build_vop3(cdna1::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_CDNA2:
+    return cdna2::build_vop3(cdna2::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_CDNA3:
+    return cdna3::build_vop3(cdna3::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_CDNA4:
+    return cdna4::build_vop3(cdna4::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_CDNA5:
+    return cdna5::build_vop3(cdna5::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_RDNA1:
+    return rdna1::build_vop3(rdna1::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_RDNA2:
+    return rdna2::build_vop3(rdna2::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_RDNA3:
+    return rdna3::build_vop3(rdna3::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_RDNA3_5:
+    return rdna3_5::build_vop3(rdna3_5::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  case ROCJITSU_CODE_ARCH_RDNA4:
+    return rdna4::build_vop3(rdna4::kVRsqF16Vop3, {.vdst = 6, .src0 = 256});
+  default:
+    return {};
+  }
+}
 std::array<uint32_t, 2> fma_f32_words(rj_code_arch_t arch, uint8_t absolute, uint8_t negate,
                                       uint8_t omod, uint8_t clamp) {
   switch (arch) {
@@ -641,6 +666,61 @@ TEST(ValuFloatingPolicy, F32UnaryDenormControls) {
          {Case{0, 0x7f000000, 0}, Case{1, 1, 0}, Case{2, 1, 0xff800000}, Case{3, 0xc3000000, 0}}) {
       const std::array<uint32_t, 1> words = unary_words(arch, c.op);
       witness("unary_f32_denorm", arch, machine.run(words, c.input), c.expected);
+    }
+  }
+}
+TEST(ValuFloatingPolicy, ReciprocalSquareRootUsesSharedMappingAcrossProfiles) {
+  // The shared one-ULP/FTZ contract applies to all profiles. Raw hardware
+  // qualification for these finite approximation witnesses covers RDNA3/4.
+  for (rj_code_arch_t arch : kAllArchitectures) {
+    InstructionPolicyMachine machine(arch);
+    const auto words = unary_words(arch, 4);
+    for (const auto &test :
+         {std::pair{0x3f80cab3u, 0x3f7f363du}, std::pair{0x80000001u, 0xff800000u},
+          std::pair{0xbf800000u, 0xffc00000u}, std::pair{0x7fa12345u, 0x7fe12345u}})
+      witness("rsq_f32_shared", arch, machine.run(words, test.first, 0, 0, 0xf0), test.second);
+  }
+}
+
+TEST(ValuFloatingPolicy, LogarithmUsesSharedMappingAcrossProfiles) {
+  // All profiles use the shared approximation; these raw finite witnesses
+  // have hardware qualification on RDNA3/4. LOG ignores rounding/denormal MODE.
+  const uint32_t captured[][2] = {
+      {0x3f7c0000u, 0xbcba1f74u}, {0x3f7e0001u, 0xbc396380u}, {0x3f800005u, 0x3566d4c6u},
+      {0x3f810000u, 0x3c37f286u}, {0x3f820001u, 0x3cb73d0fu}, {0x3f835d48u, 0x3d19508bu},
+      {0x3f860001u, 0x3d8759dbu},
+  };
+  for (rj_code_arch_t arch : kAllArchitectures) {
+    InstructionPolicyMachine machine(arch);
+    const auto words = unary_words(arch, 2);
+    for (uint32_t ieee : {0u, 1u})
+      for (uint32_t mode = 0; mode < 16; ++mode) {
+        const uint32_t raw_mode = 0xc0u | (mode & 3u) | ((mode >> 2) << 4) | (ieee << 9);
+        for (const auto &sample : captured)
+          witness("log_f32_shared", arch, machine.run(words, sample[0], 0, 0, raw_mode), sample[1]);
+      }
+  }
+}
+
+TEST(ValuFloatingPolicy, HalfReciprocalSquareRootModesAndNaNPayloads) {
+  // All profiles support F16 input denormals; the shared mapping meets the
+  // stricter 0.51-ULP bound of older RDNA/CDNA profiles.
+  // Finite witness bits are physically qualified on RDNA3/4.
+  for (rj_code_arch_t arch : kAllArchitectures) {
+    InstructionPolicyMachine machine(arch);
+    for (uint32_t mode = 0; mode < 16; ++mode) {
+      const uint32_t raw_mode = 0x30u | ((mode & 3u) << 2) | ((mode >> 2) << 6);
+      for (const auto &test :
+           {std::pair{0x0401u, 0x57ffu}, std::pair{0x7c02u, 0x7e02u}, std::pair{0xfc02u, 0xfe02u},
+            std::pair{0xbc00u, 0xfe00u}, std::pair{0x0001u, (mode & 4u) ? 0x6c00u : 0x7c00u},
+            std::pair{0x8001u, (mode & 4u) ? 0xfe00u : 0xfc00u}}) {
+        witness("rsq_f16_vop1", arch,
+                machine.run(unary_words(arch, 5), test.first, 0, 0, raw_mode) & 0xffffu,
+                test.second);
+        witness("rsq_f16_vop3", arch,
+                machine.run(rsq_f16_vop3_words(arch), test.first, 0, 0, raw_mode) & 0xffffu,
+                test.second);
+      }
     }
   }
 }
