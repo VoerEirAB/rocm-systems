@@ -14209,6 +14209,7 @@ class CodeGenerator:
         os.makedirs(shared_dir, exist_ok=True)
 
         from amdisa.codegen.execute.simd_codegen import (
+            integer_transcendental_probe_line,
             simd_extra_includes,
             simd_probe_line,
         )
@@ -14233,6 +14234,7 @@ class CodeGenerator:
             '#include "rocjitsu/isa/arch/amdgpu/shared/graphics_instructions.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/division.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/cube.h"',
+            '#include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/mul_f32_exec.h"',
             *simd_extra_includes(),
             '#include "util/data_types.h"',
             '#include "util/except.h"',
@@ -14272,10 +14274,16 @@ class CodeGenerator:
                 f'[[maybe_unused]] Inst &inst, [[maybe_unused]] Wavefront &wf'
                 f'{result_parameter}) {{'
             )
+            integer_probe = integer_transcendental_probe_line(
+                mnemonic, true16_vop3=is_true16_vop3
+            )
+            if integer_probe is not None:
+                lines.append(integer_probe)
             probe = simd_probe_line(
                 mnemonic,
                 true16_vop3=is_true16_vop3,
                 result_writer='commit_result' if uses_result_writer else None,
+                include_integer_transcendentals=False,
             )
             if mnemonic.rsplit('_', 1)[0].upper() in FLUSH_NEAREST_F32_OPS:
                 # LOG/EXP ignore guest rounding. Keep output scaling and clamp
@@ -14292,6 +14300,17 @@ class CodeGenerator:
                 'v_rcp_iflag_f32_vop1': 'classify_rcp_iflag_f32_exceptions',
                 'v_rcp_iflag_f32_vop3': 'classify_rcp_iflag_f32_exceptions',
             }
+            # Target-qualified integer implementations that report their own
+            # causes. They decline, without side effects, for every target,
+            # form, and wave state that the classifier path below must handle.
+            qualified_probes = {
+                'v_mul_f32_vop2': 'try_execute_qualified_mul_f32_vop2',
+                'v_mul_f32_vop3': 'try_execute_qualified_mul_f32_vop3',
+            }
+            qualified_probe = qualified_probes.get(mnemonic)
+            if qualified_probe is not None:
+                lines.append(f'  if (hwfloat::{qualified_probe}(inst, wf))')
+                lines.append('    return;')
             classifier = alu_classifiers.get(mnemonic)
             if classifier is not None:
                 lines.append(f'  uint32_t alu_causes = {classifier}(inst, wf);')
