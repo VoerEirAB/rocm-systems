@@ -6,6 +6,7 @@
 
 #include "rocjitsu/isa/arch/amdgpu/generated/rdna4/vdsdir.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/graphics_instructions.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/lds_direct.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/simd_glue.h"
 #include "rocjitsu/vm/amdgpu/wavefront.h"
 #include "util/data_types.h"
@@ -23,8 +24,7 @@ void DsParamLoadVdsdir::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void DsDirectLoadVdsdir::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  amdgpu::execute_lds_direct_load(wf, inst_.vdst);
 }
 
 } // namespace rdna4

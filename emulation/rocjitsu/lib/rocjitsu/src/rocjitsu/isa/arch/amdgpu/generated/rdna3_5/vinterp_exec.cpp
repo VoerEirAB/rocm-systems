@@ -19,35 +19,39 @@ namespace rocjitsu {
 namespace rdna3_5 {
 
 void VInterpP10F32Vinterp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_graphics_interp_f32(wf, inst_.vdst,
-                                      {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u},
-                                      false, inst_.neg, inst_.clamp, inst_.op_sel);
+  amdgpu::execute_graphics_interp(wf, inst_.vdst,
+                                  {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}, false,
+                                  inst_.neg, inst_.clamp, inst_.op_sel, false, false);
 }
 
 void VInterpP2F32Vinterp::execute_impl(amdgpu::Wavefront &wf) {
-  amdgpu::execute_graphics_interp_f32(wf, inst_.vdst,
-                                      {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u},
-                                      true, inst_.neg, inst_.clamp, inst_.op_sel);
+  amdgpu::execute_graphics_interp(wf, inst_.vdst,
+                                  {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}, true,
+                                  inst_.neg, inst_.clamp, inst_.op_sel, false, false);
 }
 
 void VInterpP10F16F32Vinterp::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  amdgpu::execute_graphics_interp(wf, inst_.vdst,
+                                  {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}, false,
+                                  inst_.neg, inst_.clamp, inst_.op_sel, true, false);
 }
 
 void VInterpP2F16F32Vinterp::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  amdgpu::execute_graphics_interp(wf, inst_.vdst,
+                                  {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}, true,
+                                  inst_.neg, inst_.clamp, inst_.op_sel, true, false);
 }
 
 void VInterpP10RtzF16F32Vinterp::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  amdgpu::execute_graphics_interp(wf, inst_.vdst,
+                                  {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}, false,
+                                  inst_.neg, inst_.clamp, inst_.op_sel, true, true);
 }
 
 void VInterpP2RtzF16F32Vinterp::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  amdgpu::execute_graphics_interp(wf, inst_.vdst,
+                                  {inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}, true,
+                                  inst_.neg, inst_.clamp, inst_.op_sel, true, true);
 }
 
 } // namespace rdna3_5

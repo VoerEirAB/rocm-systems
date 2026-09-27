@@ -241,7 +241,8 @@ template <PackedFloatOp Op, bool Bf16> void check_packed_half(Wavefront &wf) {
                                          : fp_mode::PackedBinaryOp::MAXIMUM;
           expected = fp_mode::packed_binary_f16(operation, a[i], b[i], wf.fp_round_mode_f16_f64(),
                                                 wf.fp_denorm_mode_f16_f64(), iteration & 1,
-                                                wf.fp16_ovfl(), floating_clamp_nan_to_zero(wf));
+                                                wf.fp16_ovfl(), floating_clamp_nan_to_zero(wf),
+                                                wf.cu().arch(), wf.ieee_mode());
         }
         ASSERT_EQ(actual[i], expected)
             << mode << ":" << iteration << " inputs=" << a[i] << "," << b[i] << "," << c[i];

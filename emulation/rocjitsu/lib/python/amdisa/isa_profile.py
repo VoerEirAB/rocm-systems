@@ -443,6 +443,11 @@ class IsaProfile(ABC):
         """Older float-atomic rules preserve selected input bits and propagate SNaNs."""
         return True
 
+    @property
+    def atomic_source_nan_first(self) -> bool:
+        """L2 ADD NaN order; indexed LDS always prefers the incoming operand."""
+        return False
+
     def scalar_atomic_denorm_modes(
         self, operation: str, elem_size: int, *, ds: bool
     ) -> tuple[str, str]:
@@ -2555,6 +2560,10 @@ class Rdna4Profile(_AmdgpuProfileBase):
         # RDNA4 chapter 13 / CDNA5 chapter 12 operate on flushed inputs.
         return False
 
+    @property
+    def atomic_source_nan_first(self) -> bool:
+        return True
+
     def scalar_atomic_denorm_modes(
         self, operation: str, elem_size: int, *, ds: bool
     ) -> tuple[str, str]:
@@ -2820,6 +2829,11 @@ class Cdna5Profile(Rdna4Profile):
     logical target used by parser/codegen rules while generated and handwritten
     C++ lives under ``amdgpu/cdna5`` in the ``cdna5`` namespace.
     """
+
+    @property
+    def atomic_source_nan_first(self) -> bool:
+        # Preserve the existing L2 policy until qualified on CDNA5 hardware.
+        return False
 
     @property
     def vmem_stores_complete_in_order(self) -> bool:

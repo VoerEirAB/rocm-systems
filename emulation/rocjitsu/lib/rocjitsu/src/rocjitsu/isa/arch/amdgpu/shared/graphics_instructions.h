@@ -14,13 +14,15 @@
 
 namespace rocjitsu::amdgpu {
 
-/// GFX11+ interpolation is FMA with fixed source selection within each quad.
-inline void execute_graphics_interp_f32(Wavefront &wf, uint32_t dst, std::array<uint32_t, 3> src,
-                                        bool second, uint32_t neg, bool clamp, uint32_t op_sel) {
+/// GFX11+ interpolation selects coefficient sources from fixed lanes within each quad.
+inline void execute_graphics_interp(Wavefront &wf, uint32_t dst, std::array<uint32_t, 3> src,
+                                    bool second, uint32_t neg, bool clamp, uint32_t op_sel,
+                                    bool f16 = false, bool rtz = false) {
   if (!wf.exec())
     return;
-  if (op_sel || dst >= wf.num_vgprs() || src[0] >= wf.num_vgprs() || src[1] >= wf.num_vgprs() ||
-      src[2] >= wf.num_vgprs()) {
+  const uint32_t allowed_op_sel = f16 ? (1u | (1u << (second ? 3 : 2))) : 0;
+  if ((op_sel & ~allowed_op_sel) || dst >= wf.num_vgprs() || src[0] >= wf.num_vgprs() ||
+      src[1] >= wf.num_vgprs() || src[2] >= wf.num_vgprs()) {
     wf.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
     return;
   }
@@ -33,7 +35,15 @@ inline void execute_graphics_interp_f32(Wavefront &wf, uint32_t dst, std::array<
       continue;
     const uint32_t quad = lane & ~3u;
     const auto read = [&](uint32_t operand, uint32_t source_lane) {
-      const uint32_t value = regs.read_vgpr(base + src[operand], source_lane);
+      const bool packed = f16 && (operand == 0 || (operand == 2 && !second));
+      const uint32_t shift = ((op_sel >> operand) & 1u) * 16;
+      uint32_t value =
+          regs.read_vgpr(base + src[operand], source_lane, packed ? 3u << (shift / 8) : 15u);
+      if (packed) {
+        uint16_t bits = value >> shift;
+        bits = fp_mode::detail::flush_input_f16(bits, wf.fp_denorm_mode_f16_f64());
+        value = std::bit_cast<uint32_t>(util::f16_to_f32(bits));
+      }
       return std::bit_cast<float>(value ^ (((neg >> operand) & 1u) << 31));
     };
     inputs[lane] = {read(0, quad + (second ? 2 : 1)), read(1, lane), read(2, second ? lane : quad)};
@@ -41,17 +51,58 @@ inline void execute_graphics_interp_f32(Wavefront &wf, uint32_t dst, std::array<
   // Register observers retain the caller's environment. Only arithmetic shares
   // the instruction's temporary FP environment across active lanes.
   {
-    fp_mode::ScopedEnvironment environment(wf.fp_round_mode_f32());
-    for (uint32_t lane = 0; lane < wf.wf_size(); ++lane)
-      if (wf.exec() & (uint64_t{1} << lane))
+    const bool half_result = f16 && second;
+    const uint32_t round_mode = rtz           ? 3
+                                : half_result ? wf.fp_round_mode_f16_f64()
+                                              : wf.fp_round_mode_f32();
+    fp_mode::ScopedEnvironment environment(half_result ? 0 : round_mode);
+    const bool clamp_nan = wf.cu().arch() == ROCJITSU_CODE_ARCH_RDNA4 || wf.dx10_clamp();
+    for (uint32_t lane = 0; lane < wf.wf_size(); ++lane) {
+      if (!(wf.exec() & (uint64_t{1} << lane)))
+        continue;
+      auto [a, b, c] = inputs[lane];
+      if (!half_result) {
         result[lane] = fp_mode::detail::packed_f32_environment(
-            inputs[lane][0], inputs[lane][1], inputs[lane][2], fp_mode::PackedF32Op::FMA,
-            wf.fp_denorm_mode_f32(), clamp, true, wf.cu().arch(), wf.ieee_mode());
+            a, b, c, fp_mode::PackedF32Op::FMA, wf.fp_denorm_mode_f32(), clamp, clamp_nan,
+            wf.cu().arch(), wf.ieee_mode());
+        continue;
+      }
+      // P2 rounds the fused result directly to F16. Rounding through an F32
+      // intermediate loses directed-rounding and halfway cases.
+      if (!(wf.fp_denorm_mode_f32() & 1u)) {
+        for (float *value : {&b, &c}) {
+          const uint32_t bits = std::bit_cast<uint32_t>(*value);
+          if ((bits & 0x7f800000u) == 0)
+            *value = std::bit_cast<float>(bits & 0x80000000u);
+        }
+      }
+      double value;
+      if (std::isfinite(a) && std::isfinite(b) && std::isfinite(c)) {
+        const auto exact = fp_mode::detail::add_exact(double(a) * double(b), double(c));
+        value = fp_mode::detail::round_to_odd(exact);
+        if (exact.value == 0 && exact.error == 0) {
+          const bool product_sign = std::signbit(a) != std::signbit(b);
+          const bool matching_zeros = c == 0 && product_sign == std::signbit(c);
+          value = (matching_zeros ? product_sign : round_mode == 2) ? -0.0 : 0.0;
+        }
+      } else {
+        value = fp_mode::fma_f32(a, b, c, wf.cu().arch(), true, 3);
+      }
+      result[lane] = fp_mode::round_fma_f16(value, round_mode, wf.fp_denorm_mode_f16_f64(), clamp,
+                                            wf.fp16_ovfl(), clamp_nan);
+    }
   }
   // Snapshot every quad's inputs before writing: destination may alias P0/P10/P20.
-  for (uint32_t lane = 0; lane < wf.wf_size(); ++lane)
-    if (wf.exec() & (uint64_t{1} << lane))
+  for (uint32_t lane = 0; lane < wf.wf_size(); ++lane) {
+    if (!(wf.exec() & (uint64_t{1} << lane)))
+      continue;
+    if (f16 && second) {
+      const uint32_t shift = (op_sel & 8) ? 16 : 0;
+      regs.write_vgpr(base + dst, lane, result[lane] << shift, 3u << (shift / 8));
+    } else {
       regs.write_vgpr(base + dst, lane, result[lane]);
+    }
+  }
 }
 
 /// Expand one LDS parameter's P0/P10/P20 into lanes 0/1/2 of every active quad.
@@ -78,8 +129,8 @@ inline void execute_graphics_parameter_load(Wavefront &wf, uint32_t dst, uint32_
       ++primitive;
     if (!(wf.exec() & (uint64_t{15} << (quad * 4))))
       continue;
-    const uint32_t address =
-        (wf.m0() & 0xffff) + 4 * (attribute * count * 12 + primitive * 12 + component * 3);
+    const uint32_t address = wf.lds_base() + (wf.m0() & 0xffff) +
+                             4 * (attribute * count * 12 + primitive * 12 + component * 3);
     for (uint32_t coefficient = 0; coefficient < 3; ++coefficient)
       regs.write_vgpr(destination, quad * 4 + coefficient,
                       wf.lds().read32(address + coefficient * 4));

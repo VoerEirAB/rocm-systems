@@ -20,12 +20,23 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 
 namespace rocjitsu::amdgpu {
 
+enum class ImageTransferMode { Default, Mip, Packed, PackedSigned, MipPacked, MipPackedSigned };
+
 enum class ImageSampleMode { Implicit, Zero, Explicit, Bias, Derivatives, Derivatives16 };
+
+struct ImageSampleModifiers {
+  bool offset = false;
+  bool compare = false;
+  bool lod_clamp = false;
+  bool gather = false;
+  bool horizontal = false;
+};
 
 using ImageLodResults = std::array<std::array<float, 2>, 64>;
 
@@ -37,12 +48,13 @@ inline double round_sample_fixed8(double value) {
 
 /// Prepare GFX11/12 image transfers and sampling.
 inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t resource,
-                                   uint32_t data, std::array<uint32_t, 7> coords, uint32_t dim,
+                                   uint32_t data, std::array<uint32_t, 12> coords, uint32_t dim,
                                    uint32_t mask, bool d16, bool unsupported_flags,
                                    uint32_t sampler = ~0u,
                                    ImageSampleMode sample_mode = ImageSampleMode::Implicit,
                                    bool a16 = false, ImageLodResults *queried_lods = nullptr,
-                                   bool mip_load = false) {
+                                   ImageTransferMode transfer_mode = ImageTransferMode::Default,
+                                   ImageSampleModifiers modifiers = {}) {
   const auto unsupported = [&] {
     wf.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
     return false;
@@ -50,9 +62,18 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const auto arch = wf.cu().arch();
   const bool gfx12 = arch == ROCJITSU_CODE_ARCH_RDNA4;
   const bool query = queried_lods != nullptr;
+  const bool atomic = d.atomic_op != AtomicOp::NONE;
+  const bool mip_transfer = transfer_mode == ImageTransferMode::Mip ||
+                            transfer_mode == ImageTransferMode::MipPacked ||
+                            transfer_mode == ImageTransferMode::MipPackedSigned;
+  const bool packed =
+      transfer_mode != ImageTransferMode::Default && transfer_mode != ImageTransferMode::Mip;
+  const bool packed_signed = transfer_mode == ImageTransferMode::PackedSigned ||
+                             transfer_mode == ImageTransferMode::MipPackedSigned;
   if ((!gfx12 && arch != ROCJITSU_CODE_ARCH_RDNA3 && arch != ROCJITSU_CODE_ARCH_RDNA3_5) ||
-      unsupported_flags || (dim != 0 && dim != 1 && dim != 3 && dim != 4 && dim != 5) || !mask ||
-      (mask & ~15u) || (query && (d16 || (mask & ~3u))))
+      unsupported_flags || (packed && d16) ||
+      (dim != 0 && dim != 1 && dim != 3 && dim != 4 && dim != 5) || !mask || (mask & ~15u) ||
+      (query && (d16 || (mask & ~3u))) || (modifiers.gather && std::popcount(mask) != 1))
     return unsupported();
   std::array<uint32_t, 8> r{};
   for (uint32_t i = 0; i < r.size(); ++i)
@@ -67,30 +88,48 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   uint32_t height = ((r[2] >> 14) & (gfx12 ? 0xffff : 0x3fff)) + 1;
   const uint32_t image_format = (r[1] >> (gfx12 ? 17 : 20)) & 255;
   const uint32_t format = image_format == 66 ? 42 : image_format;
-  d.image_srgb = image_format == 66;
+  d.image_srgb = image_format == 66 && !packed;
   const bool compressed = !gfx12 && (r[6] & (1u << 21));
   const auto decoded = decode_buffer_format(format);
   if (decoded.failed())
     return unsupported();
   d.decoded_buffer_format = decoded.value();
   const uint32_t bytes = d.decoded_buffer_format.byte_size();
+  if (packed) {
+    // PCK ignores format conversion and descriptor channel selectors. DMASK
+    // selects raw DWORDs; a sub-DWORD texel occupies one extended word.
+    auto &raw = d.decoded_buffer_format;
+    for (uint32_t i = 0; i < 4; ++i)
+      raw.widths[i] = bytes > i * 4 ? std::min(4u, bytes - i * 4) * 8 : 0;
+    raw.number = packed_signed ? BufferNumberFormat::Sint : BufferNumberFormat::Uint;
+  }
+  const bool float_atomic = d.atomic_op == AtomicOp::FADD || d.atomic_op == AtomicOp::FMIN ||
+                            d.atomic_op == AtomicOp::FMAX || d.atomic_op == AtomicOp::PK_ADD_F16 ||
+                            d.atomic_op == AtomicOp::PK_ADD_BF16;
+  const uint32_t atomic_words = (bytes / 4) * (d.atomic_op == AtomicOp::CMPSWAP ? 2 : 1);
+  if (atomic && ((bytes != 4 && bytes != 8) || (float_atomic && bytes != 4) || d16 || compressed ||
+                 mask != (1u << atomic_words) - 1))
+    return unsupported();
   const uint32_t max_level = gfx12 ? (r[1] >> 12) & 31 : (r[1] >> 16) & 15;
   const uint32_t first_level = gfx12 ? (r[1] >> 25) & 31 : (r[3] >> 12) & 15;
   const uint32_t last_level = gfx12 ? (r[3] >> 15) & 31 : (r[3] >> 16) & 15;
   const uint32_t perf_mod = (r[5] >> 20) & 7;
+  const double resident_min_lod =
+      ((r[5] >> (gfx12 ? 26 : 27)) | ((r[6] & 127) << (gfx12 ? 6 : 5))) / 256.0;
   const bool sample = sampler != ~0u;
-  if (dim == 3 && !sample)
-    return unsupported();
+  const bool one_dimensional = dim == 0 || dim == 4;
+  const uint32_t spatial_components = one_dimensional ? 1 : 2;
+  const bool layer_coordinate = dim == 3 || dim == 4 || dim == 5;
   d.image_sampling = sample;
   const uint32_t first_layer = (r[4] >> 16) & (gfx12 ? 0x3fff : 0x1fff);
   const uint32_t last_layer = is_array ? r[4] & (gfx12 ? 0x3fff : 0x1fff) : 0;
-  if ((type != 8 && type != 9 && !is_array) || (dim == 0 && type != 8) ||
+  if ((type != 8 && type != 9 && !is_array) || (dim == 0 && type != 8 && type != 12) ||
       ((type == 8 || type == 12) && (height != 1 || (!query && swizzle))) ||
-      (dim == 4 && type != 8 && type != 12) || (type == 12 && (dim != 4 || sample)) ||
+      (dim == 4 && type != 8 && type != 12) || (type == 12 && dim != 0 && dim != 4) ||
       (!is_array && (r[4] >> 16)) || (!query && !bytes) ||
       (is_array && (first_layer > last_layer || (r[4] & (gfx12 ? 0xc000c000u : 0xe000e000u)))) ||
       first_level > last_level || last_level > max_level ||
-      (!query && max_level && !is_array && r[4]) || (!d.is_load && d.image_srgb))
+      (!query && max_level && !is_array && r[4]) || (!d.is_load && d.image_srgb && !atomic))
     return unsupported();
   if (dim == 3 && (type != 11 || width != height || first_layer % 6 || last_layer < first_layer ||
                    last_layer - first_layer < 5))
@@ -122,12 +161,16 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   double min_lod = 0, max_lod = 0, lod_bias = 0;
   const bool g16 = sample_mode == ImageSampleMode::Derivatives16;
   const bool derivatives = g16 || sample_mode == ImageSampleMode::Derivatives;
-  uint32_t coordinate_offset = 0;
+  const uint32_t bias_offset = modifiers.offset;
+  const uint32_t compare_offset = bias_offset + (sample_mode == ImageSampleMode::Bias);
+  const uint32_t gradient_offset = compare_offset + modifiers.compare;
+  uint32_t coordinate_offset = gradient_offset;
   uint32_t wrap_x = 2, wrap_y = 2;
   if (sample) {
     // RADV's blit shaders use array coordinates for single-layer 2D resources
     // as well. Their descriptor still bounds the selected layer to zero.
-    if ((dim != 1 && (dim != 5 || (type != 9 && type != 13)) && dim != 3) || !d.is_load)
+    if ((dim == 5 && type != 9 && type != 13) || !d.is_load ||
+        (modifiers.gather && one_dimensional))
       return unsupported();
     std::array<uint32_t, 4> s{};
     for (uint32_t i = 0; i < s.size(); ++i) {
@@ -136,7 +179,12 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       s[i] = read_scalar_selector(wf, sampler + i);
     }
     wrap_x = s[0] & 7;
-    wrap_y = (s[0] >> 3) & 7;
+    wrap_y = one_dimensional ? 2 : (s[0] >> 3) & 7;
+    if (modifiers.horizontal) {
+      // 4H keeps border addressing but treats every other wrap mode as edge clamp.
+      wrap_x = wrap_x == 6 ? 6 : 2;
+      wrap_y = wrap_y == 6 ? 6 : 2;
+    }
     mag_filter = (s[2] >> 20) & 3;
     min_filter = (s[2] >> 22) & 3;
     // Cube sampling uses the major footprint without anisotropic taps.
@@ -154,7 +202,6 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     aniso_bias = (s[0] >> 21) & 63;
     perf_mip = gfx12 ? ((s[2] >> 30) | ((s[3] & 3) << 2)) : (s[1] >> 24) & 15;
     const auto supported_wrap = [](uint32_t wrap) { return wrap <= 3 || wrap == 6; };
-    // These sample opcodes do not use DEPTH_COMPARE_FUNC.
     if (!supported_wrap(wrap_x) || !supported_wrap(wrap_y) || (s[0] & ((3u << 29) | (3u << 19))) ||
         (s[2] & (3u << 24)) || mip_filter > 2)
       return unsupported();
@@ -177,14 +224,20 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     const bool filterable = format == 1 || format == 14 || format == 36 || format == 42 ||
                             format == 13 || format == 29 || format == 57 || format == 22 ||
                             format == 50 || format == 63;
-    if (min_lod > max_lod ||
-        (!query && (min_filter || mag_filter || mip_filter == 2) && !filterable))
+    if (min_lod > max_lod || (!query && !modifiers.gather &&
+                              (min_filter || mag_filter || mip_filter == 2) && !filterable))
       return unsupported();
     if (sample_mode == ImageSampleMode::Bias)
-      coordinate_offset = 1;
+      coordinate_offset = compare_offset + modifiers.compare;
     else if (derivatives)
-      coordinate_offset = g16 ? 2 : 4;
-    if (!query && (min_filter || mag_filter || mip_filter == 2 || wrap_x == 6 || wrap_y == 6)) {
+      coordinate_offset = gradient_offset + (g16 ? 2 : 2 * spatial_components);
+    if (modifiers.gather) {
+      // Gather selects one mip and returns a footprint without filtering.
+      min_filter = mag_filter = 1;
+      mip_filter = mip_filter ? 1 : 0;
+    }
+    if (!query && (min_filter || mag_filter || mip_filter == 2 || wrap_x == 6 || wrap_y == 6 ||
+                   modifiers.compare)) {
       if ((s[3] >> 30) == 3)
         return unsupported(); // Custom border-color tables.
       d.image_sample = std::make_unique<ImageSampleAccess>();
@@ -194,36 +247,63 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       d.image_sample->taps_per_filter = d.image_sample->tap_count;
       d.image_sample->taps.resize(d.image_sample->tap_count);
       d.image_sample->border_color = s[3] >> 30;
+      d.image_sample->gather = modifiers.gather;
+      d.image_sample->horizontal = modifiers.horizontal;
+      if (modifiers.compare) {
+        d.image_sample->comparison = std::make_unique<ImageSampleAccess::Comparison>();
+        d.image_sample->comparison->function = (s[0] >> 12) & 7;
+      }
     }
   }
   // The functional model retains uncompressed backing for image operations.
   // The memory pipeline materializes GFX11 metadata clears before each access.
-  d.buffer_components = std::popcount(mask);
+  d.buffer_components = atomic ? 0 : modifiers.gather ? 4 : std::popcount(mask);
   d.buffer_d16 = d16;
   d.buffer_format = format;
   d.buffer_format_encoding = BufferFormatEncoding::Gfx11;
   // Physical GFX11/12 stores select logical channels even with D16. GFX11
   // zero-fills omitted channels; GFX12 replicates the first supplied component.
   const uint32_t channel_mask = mask;
+  uint32_t selectors = packed ? 0xfacu : r[3];
+  if (d.is_load && !packed) {
+    // Image channels repeat with the resource's component count, including
+    // border colors. Buffer-format loads instead zero absent components.
+    const uint32_t components =
+        std::count_if(d.decoded_buffer_format.widths.begin(), d.decoded_buffer_format.widths.end(),
+                      [](uint32_t width) { return width != 0; });
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t selector = (selectors >> (3 * i)) & 7;
+      if (selector >= 4 && components) {
+        selectors &= ~(7u << (3 * i));
+        selectors |= (4 + (selector - 4) % components) << (3 * i);
+      }
+    }
+  }
   uint32_t component = 0;
   for (uint32_t i = 0; i < 4; ++i)
     if (channel_mask & (1u << i))
-      d.buffer_selectors |= ((r[3] >> (3 * i)) & 7) << (3 * component++);
-  if (!d.is_load && gfx12)
+      d.buffer_selectors |= ((selectors >> (3 * i)) & 7) << (3 * component++);
+  if (modifiers.gather)
+    d.buffer_selectors *= 0b001001001001u; // Repeat the selected channel for four returned texels.
+  // Packed stores replicate logical X, which is zero if DMASK omits it.
+  if (!d.is_load && gfx12 && (!packed || (mask & 1)))
     for (uint32_t i = 0; i < 4; ++i)
       if (!(channel_mask & (1u << i)))
-        d.buffer_selectors |= ((r[3] >> (3 * i)) & 7) << (3 * component++);
+        d.buffer_selectors |= ((selectors >> (3 * i)) & 7) << (3 * component++);
   d.wf_size = wf.wf_size();
   d.exec_mask = wf.exec();
   d.elem_size = bytes;
   d.num_elems = 1;
   d.dst_reg_base = wf.vgpr_alloc().base + data;
-  const uint32_t registers = d16 ? (d.buffer_components + 1) / 2 : d.buffer_components;
+  const uint32_t registers = atomic ? atomic_words
+                             : d16  ? (d.buffer_components + 1) / 2
+                                    : d.buffer_components;
   if (data >= wf.num_vgprs() || registers > wf.num_vgprs() - data)
     return unsupported();
   const uint32_t body_components =
-      2 + (dim == 5 || dim == 3) + (sample_mode == ImageSampleMode::Explicit);
-  const uint32_t load_components = (dim == 5 ? 3 : dim == 0 ? 1 : 2) + mip_load;
+      spatial_components + layer_coordinate +
+      (sample_mode == ImageSampleMode::Explicit || modifiers.lod_clamp);
+  const uint32_t load_components = spatial_components + layer_coordinate + mip_transfer;
   const uint32_t coordinate_count =
       !sample ? (a16 ? (load_components + 1) / 2 : load_components)
               : coordinate_offset + (a16 ? (body_components + 1) / 2 : body_components);
@@ -272,6 +352,15 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     uint32_t x = sample ? 0 : load_coordinate(0);
     uint32_t y = sample || dim == 0 || dim == 4 ? 0 : load_coordinate(1);
     if (sample) {
+      int32_t offset_x = 0, offset_y = 0;
+      if (modifiers.offset && dim != 3) {
+        const uint32_t offset = read_coordinate(0, 0, false, lane);
+        offset_x = int32_t((offset & 63) ^ 32) - 32;
+        offset_y = one_dimensional ? 0 : int32_t(((offset >> 8) & 63) ^ 32) - 32;
+      }
+      if (modifiers.compare)
+        d.image_sample->comparison->references[lane] =
+            std::bit_cast<float>(read_coordinate(0, compare_offset, false, lane));
       const auto read = [&](uint32_t index, uint32_t source_lane) {
         if (a16 && index >= coordinate_offset) {
           const uint32_t component = index - coordinate_offset;
@@ -280,35 +369,45 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         }
         return std::bit_cast<float>(read_coordinate(0, index, false, source_lane));
       };
-      double u = read(coordinate_offset, lane), v = read(coordinate_offset + 1, lane);
+      double u = read(coordinate_offset, lane),
+             v = one_dimensional ? 0.5 : read(coordinate_offset + 1, lane);
       if (!std::isfinite(u) || !std::isfinite(v))
         return unsupported();
-      uint32_t layer = first_layer, face = 0;
+      uint32_t layer = first_layer, face = 0, cube_base = first_layer;
+      const auto cube_token = [&](double selected) -> std::optional<int32_t> {
+        if (!std::isfinite(selected) || selected < INT32_MIN || selected > INT32_MAX)
+          return std::nullopt;
+        return static_cast<int32_t>(selected);
+      };
       if (dim == 3) {
-        const double selected = read(coordinate_offset + 2, lane);
-        if (!std::isfinite(selected) || selected < 0 || selected > 5 ||
-            selected != std::trunc(selected))
+        const auto token = cube_token(read(coordinate_offset + 2, lane));
+        if (!token)
           return unsupported();
-        face = static_cast<uint32_t>(selected);
-        layer += face;
+        face = std::min(uint32_t(*token) & 7u, 5u);
+        const uint32_t cube =
+            std::clamp(*token >> 3, 0, int32_t((last_layer - first_layer - 5) / 6));
+        cube_base += cube * 6;
+        layer = cube_base + face;
         u -= 1;
         v -= 1;
       }
-      if (dim == 5 && !query) {
-        const double slice = read(coordinate_offset + 2, lane);
+      if ((dim == 4 || dim == 5) && !query) {
+        const double slice = read(coordinate_offset + spatial_components, lane);
         if (!std::isfinite(slice))
           return unsupported();
-        // RADV emits V_RNDNE_F32 for the floating-point slice before sampling.
-        // Convert that integral value and clamp it to the resource view.
-        layer += static_cast<uint32_t>(
-            std::clamp(std::trunc(slice), 0.0, double(last_layer - first_layer)));
+        // Array slices use nearest-even conversion before view clamping.
+        const double lower = std::floor(slice), fraction = slice - lower;
+        const double rounded =
+            lower + (fraction > 0.5 || (fraction == 0.5 && std::fmod(lower, 2.0) != 0));
+        layer += static_cast<uint32_t>(std::clamp(rounded, 0.0, double(last_layer - first_layer)));
       }
       double lod = 0;
       bool zero_footprint = false;
       uint32_t filter_count = 1;
       double sample_step_u = 0, sample_step_v = 0;
       if (sample_mode == ImageSampleMode::Explicit) {
-        lod = round_sample_fixed8(read(coordinate_offset + 2 + (dim == 5 || dim == 3), lane)) +
+        lod = round_sample_fixed8(
+                  read(coordinate_offset + spatial_components + layer_coordinate, lane)) +
               lod_bias;
       } else if (sample_mode == ImageSampleMode::Zero) {
         lod = lod_bias;
@@ -322,39 +421,38 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
           // G16 stores (dxu, dxv), then (dyu, dyv), low half first.
           // A16 independently controls the coordinate body after the gradients.
           const auto gradient = [&](uint32_t component) {
-            const uint32_t value = read_coordinate(0, component, g16, lane);
+            const uint32_t value = read_coordinate(gradient_offset, component, g16, lane);
             return g16 ? util::f16_to_f32(static_cast<uint16_t>(value))
                        : std::bit_cast<float>(value);
           };
           dxu = gradient(0);
-          dxv = gradient(1);
-          dyu = gradient(2);
-          dyv = gradient(3);
+          dxv = one_dimensional ? 0 : gradient(1);
+          dyu = gradient(one_dimensional && !g16 ? 1 : 2);
+          dyv = one_dimensional ? 0 : gradient(3);
         } else {
           const uint32_t origin = lane & ~3u;
           uint32_t derivative_face = face;
           if (dim == 3) {
-            const double selected = read(coordinate_offset + 2, origin);
-            if (!std::isfinite(selected) || selected < 0 || selected > 5 ||
-                selected != std::trunc(selected))
+            const auto selected = cube_token(read(coordinate_offset + 2, origin));
+            if (!selected)
               return unsupported();
-            derivative_face = static_cast<uint32_t>(selected);
+            derivative_face = std::min(uint32_t(*selected) & 7u, 5u);
           }
           // Unfold onto the quad origin's face. Choosing each lane's face
           // introduces different footprints where three cube faces meet.
           const auto unfolded = [&](uint32_t source_lane) -> std::optional<std::array<double, 2>> {
             const double su = read(coordinate_offset, source_lane);
-            const double sv = read(coordinate_offset + 1, source_lane);
+            const double sv = one_dimensional ? 0.5 : read(coordinate_offset + 1, source_lane);
             if (!std::isfinite(su) || !std::isfinite(sv))
               return std::nullopt;
             if (dim != 3)
               return std::array{su, sv};
-            const double sf = read(coordinate_offset + 2, source_lane);
-            if (!std::isfinite(sf) || sf < 0 || sf > 5 || sf != std::trunc(sf))
+            const auto sf = cube_token(read(coordinate_offset + 2, source_lane));
+            if (!sf)
               return std::nullopt;
-            if (sf == derivative_face)
+            const uint32_t source_face = std::min(uint32_t(*sf) & 7u, 5u);
+            if (source_face == derivative_face)
               return std::array{su - 1, sv - 1};
-            const uint32_t source_face = static_cast<uint32_t>(sf);
             if (source_face / 2 == derivative_face / 2) {
               // Opposite faces select the coarsest available mip.
               unbounded_cube_footprint = true;
@@ -418,7 +516,9 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         }
         lod += lod_bias;
         if (sample_mode == ImageSampleMode::Bias)
-          lod += read(0, lane);
+          lod += a16 ? util::f16_to_f32(
+                           static_cast<uint16_t>(read_coordinate(0, bias_offset, false, lane)))
+                     : read(bias_offset, lane);
         if (unbounded_cube_footprint) {
           lod = max_lod;
           filter_count = 1;
@@ -426,8 +526,22 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       }
       if (!std::isfinite(lod))
         return unsupported();
+      if (modifiers.lod_clamp) {
+        const double minimum =
+            read(coordinate_offset + spatial_components + layer_coordinate, lane);
+        if (!std::isfinite(minimum))
+          return unsupported();
+        // Physical GFX11/12 CL is a per-lane minimum, despite the manual's
+        // maximum wording. It combines with the sampler's minimum LOD.
+        lod = std::max(lod, minimum);
+      }
       const double raw_lod = zero_footprint ? 0 : lod;
-      lod = round_sample_fixed8(std::clamp(lod, min_lod, max_lod));
+      lod = std::clamp(lod, min_lod, max_lod);
+      // LZ gather stays at its fixed mip. Other samples clamp to the resource's
+      // resident minimum, independently of the sampler's LOD interval.
+      if (!(modifiers.gather && sample_mode == ImageSampleMode::Zero))
+        lod = std::max(lod, resident_min_lod - first_level);
+      lod = round_sample_fixed8(lod);
       const uint32_t selected_filter = lod <= 0 ? mag_filter : min_filter;
       const bool linear = selected_filter & 1;
       if (!(selected_filter & 2))
@@ -443,6 +557,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         (*queried_lods)[lane] = {static_cast<float>(clamped_lod), static_cast<float>(raw_lod)};
         continue;
       }
+      if (modifiers.gather && level < uint32_t(resident_min_lod))
+        continue;
       if (wrap_x == 3)
         u = std::abs(u);
       if (wrap_y == 3)
@@ -505,21 +621,25 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
             sample_v = image_sample_coordinate(v, offset * sample_step_v);
           }
           if (texel % 4 == 0 && source == 0) {
-            double px = sample_u * (normalized ? selected->width : 1) - (linear ? 0.5 : 0);
-            double py = sample_v * (normalized ? selected->height : 1) - (linear ? 0.5 : 0);
+            double px = sample_u * (normalized ? selected->width : 1) + offset_x -
+                        (modifiers.horizontal ? 1.5
+                         : linear             ? 0.5
+                                              : 0);
+            double py = sample_v * (normalized ? selected->height : 1) + offset_y -
+                        (linear && !modifiers.horizontal ? 0.5 : 0);
             // Clamp to texel centers before generating weights. This preserves
             // exact edge texels, including signed zero in a 1x1 mip level.
-            if (linear && !seamless_cube && (wrap_x == 2 || wrap_x == 3))
+            if (linear && !modifiers.gather && !seamless_cube && (wrap_x == 2 || wrap_x == 3))
               px = std::clamp(px, 0.0, double(selected->width - 1));
-            if (linear && !seamless_cube && (wrap_y == 2 || wrap_y == 3))
+            if (linear && !modifiers.gather && !seamless_cube && (wrap_y == 2 || wrap_y == 3))
               py = std::clamp(py, 0.0, double(selected->height - 1));
             x0 = std::floor(px);
             y0 = std::floor(py);
             access.filters[filter_index].fractions[lane][mip_index] =
                 linear ? std::array{fraction(px - x0), fraction(py - y0)} : std::array{0.0f, 0.0f};
           }
-          const double raw_x = x0 + (linear ? texel & 1 : 0);
-          const double raw_y = y0 + (linear ? (texel >> 1) & 1 : 0);
+          const double raw_x = x0 + (modifiers.horizontal ? texel : linear ? texel & 1 : 0);
+          const double raw_y = y0 + (linear && !modifiers.horizontal ? (texel >> 1) & 1 : 0);
           std::optional<uint32_t> tx, ty;
           uint32_t selected_layer = layer;
           if (seamless_cube) {
@@ -538,7 +658,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
                                                      source == 1 ? cy : raw_y, selected->width);
                 tx = mapped.x;
                 ty = mapped.y;
-                selected_layer = first_layer + mapped.face;
+                selected_layer = cube_base + mapped.face;
               }
             } else {
               if (source)
@@ -546,7 +666,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
               const auto mapped = image_cube_texel(face, raw_x, raw_y, selected->width);
               tx = mapped.x;
               ty = mapped.y;
-              selected_layer = first_layer + mapped.face;
+              selected_layer = cube_base + mapped.face;
             }
           } else {
             tx = address_coordinate(raw_x, selected->width, wrap_x);
@@ -577,10 +697,10 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         d.lane_mask |= uint64_t{1} << lane;
         continue;
       }
-      x = *address_coordinate(std::floor(u * (normalized ? lane_mip->width : 1)), lane_mip->width,
-                              wrap_x);
-      y = *address_coordinate(std::floor(v * (normalized ? lane_mip->height : 1)), lane_mip->height,
-                              wrap_y);
+      x = *address_coordinate(std::floor(u * (normalized ? lane_mip->width : 1) + offset_x),
+                              lane_mip->width, wrap_x);
+      y = *address_coordinate(std::floor(v * (normalized ? lane_mip->height : 1) + offset_y),
+                              lane_mip->height, wrap_y);
       const uint64_t selected_base = image_layer_base(gfx12, resource_base + lane_mip->offset,
                                                       lane_mip->slice_size, layer, bytes, swizzle);
       const auto address =
@@ -599,14 +719,14 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       d.lane_mask |= uint64_t{1} << lane;
       continue;
     }
-    const uint32_t relative_layer = dim == 5   ? load_coordinate(2)
-                                    : dim == 4 ? load_coordinate(1)
-                                               : 0;
+    const uint32_t relative_layer = dim == 5 || dim == 3 ? load_coordinate(2)
+                                    : dim == 4           ? load_coordinate(1)
+                                                         : 0;
     if (!is_array && relative_layer)
       return unsupported();
-    // IMAGE_LOAD_MIP supplies an unsigned, view-relative LOD per lane.
+    // Explicit mip transfers supply an unsigned, view-relative LOD per lane.
     // Reject it before adding the base level, including values that would wrap.
-    const uint32_t relative_level = mip_load ? load_coordinate(load_components - 1) : 0;
+    const uint32_t relative_level = mip_transfer ? load_coordinate(load_components - 1) : 0;
     if (relative_level > last_level - first_level)
       continue;
     const uint32_t level = first_level + relative_level;
@@ -635,7 +755,19 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     }
     d.lane_mask |= uint64_t{1} << lane;
   }
-  if (!d.is_load)
+  if (atomic) {
+    // Image atomic payloads are raw words. DMASK includes the comparison
+    // operand, while the return value occupies only one memory element.
+    d.store_data.resize(wf.wf_size() * atomic_words * 4);
+    for (uint32_t lane = 0; lane < wf.wf_size(); ++lane) {
+      if (!(wf.exec() & (uint64_t{1} << lane)))
+        continue;
+      for (uint32_t word = 0; word < atomic_words; ++word) {
+        const uint32_t value = regs.read_vgpr(d.dst_reg_base + word, lane);
+        std::memcpy(d.store_data.data() + (lane * atomic_words + word) * 4, &value, 4);
+      }
+    }
+  } else if (!d.is_load)
     capture_buffer_format_store(wf, d, d.dst_reg_base);
   return true;
 }
@@ -643,8 +775,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
 /// Compute LODs before writing any lane: VDATA may alias quad coordinates,
 /// including coordinates supplied by lanes outside EXEC.
 inline void execute_image_lod(Wavefront &wf, uint32_t resource, uint32_t sampler, uint32_t data,
-                              std::array<uint32_t, 7> coords, uint32_t dim, uint32_t mask, bool d16,
-                              bool unsupported_flags, bool a16) {
+                              std::array<uint32_t, 12> coords, uint32_t dim, uint32_t mask,
+                              bool d16, bool unsupported_flags, bool a16) {
   VectorMemState state(GLOBAL_MEM);
   state.is_load = true;
   ImageLodResults results{};

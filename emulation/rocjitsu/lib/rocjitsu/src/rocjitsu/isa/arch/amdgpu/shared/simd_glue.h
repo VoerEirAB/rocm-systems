@@ -4193,7 +4193,8 @@ inline U packed_float_half_simd(U a_bits, U b_bits, U c_bits, Wavefront &wf, boo
                                          : fp_mode::PackedBinaryOp::MAXIMUM;
           output[i] = fp_mode::packed_binary_f16(
               operation, a_bits[i], b_bits[i], wf.fp_round_mode_f16_f64(),
-              wf.fp_denorm_mode_f16_f64(), clamp, wf.fp16_ovfl(), floating_clamp_nan_to_zero(wf));
+              wf.fp_denorm_mode_f16_f64(), clamp, wf.fp16_ovfl(), floating_clamp_nan_to_zero(wf),
+              wf.cu().arch(), wf.ieee_mode());
           continue;
         }
       }

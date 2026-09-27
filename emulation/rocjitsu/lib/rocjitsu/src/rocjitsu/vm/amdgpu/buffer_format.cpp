@@ -533,7 +533,8 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
   // directly instead of normalizing to FP32 and rounding back for each tap.
   const bool unorm8_texels =
       d.image_sample && d.image_sample->tap_count >= 4 && !d.image_srgb &&
-      format.number == Number::Unorm && format.widths[0] == 8 &&
+      !d.image_sample->comparison && !d.image_sample->gather && format.number == Number::Unorm &&
+      format.widths[0] == 8 &&
       std::ranges::all_of(format.widths, [](uint32_t width) { return width == 0 || width == 8; });
   // The first active lane touches every destination register with the original
   // arithmetic state, including any lazy-storage allocation. Later VGPR lanes
@@ -557,6 +558,8 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
                                    .subspan((tap * d.wf_size + lane) * d.elem_size, d.elem_size)
                              : std::span<const uint8_t>{};
       std::array<uint32_t, 4> values{};
+      if (d.image_sample && d.image_sample->gather && !valid)
+        return values;
       if (integer_texels) {
         for (uint32_t c = 0; c < d.buffer_components; ++c) {
           const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
@@ -598,10 +601,48 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
             values[i] &= 0x80000000u;
         }
       }
+      if (d.image_sample && d.image_sample->comparison) {
+        const auto &comparison = *d.image_sample->comparison;
+        const float reference = comparison.references[lane];
+        for (uint32_t i = 0; i < d.buffer_components; ++i) {
+          const float value = std::bit_cast<float>(values[i]);
+          const bool comparisons[] = {false,
+                                      (reference < value),
+                                      reference == value,
+                                      reference <= value,
+                                      (reference > value),
+                                      reference != value,
+                                      reference >= value,
+                                      true};
+          values[i] = comparisons[comparison.function] ? 0x3f800000u : 0;
+        }
+      }
       return values;
     };
     auto values = texel(0);
-    if (d.image_sample && d.image_sample->tap_count >= 4) {
+    if (d.image_sample && d.image_sample->gather) {
+      // Ordinary gather starts at lower left and proceeds counterclockwise.
+      // Horizontal gather returns left to right.
+      constexpr uint32_t order[] = {2, 3, 1, 0};
+      for (uint32_t i = 0; i < 4; ++i) {
+        const auto &access = *d.image_sample;
+        const uint32_t tap = access.horizontal ? i : order[i];
+        const uint32_t first = tap * access.texels_per_tap;
+        values[i] = texel(first)[0];
+        if (access.filters[0].cube_corners[lane][0] & (1u << tap)) {
+          // Integer cube gathers return zero at the missing corner.
+          if (integer(format.number)) {
+            values[i] = 0;
+            continue;
+          }
+          const double a = std::bit_cast<float>(values[i]);
+          const double b = std::bit_cast<float>(texel(first + 1)[0]);
+          const double c = std::bit_cast<float>(texel(first + 2)[0]);
+          values[i] = std::bit_cast<uint32_t>(
+              static_cast<float>((a * 21846 + b * 21845 + c * 21845) / 65536));
+        }
+      }
+    } else if (d.image_sample && d.image_sample->tap_count >= 4) {
       const uint32_t filter_count = d.image_sample->filter_counts[lane];
       const uint32_t tap_count = filter_count * d.image_sample->taps_per_filter;
       // Initialize only the texels consumed by this lane's filters, reusing
@@ -623,7 +664,7 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
           }
         for (uint32_t c = 0; c < d.buffer_components; ++c) {
           const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
-          const bool fixed_unorm = format.number == Number::Unorm &&
+          const bool fixed_unorm = !d.image_sample->comparison && format.number == Number::Unorm &&
                                    (format.widths[0] == 8 || format.widths[0] == 10) &&
                                    (!d.image_srgb || selector == 7);
           const uint32_t unorm_width = format.widths[0] == 10 ? 10 : 8;

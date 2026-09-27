@@ -119,7 +119,7 @@ def gen_pk_binop(
                     f'    if (inst_.{neg} & {1 << bit}u) {name}_{half} ^= 0x8000u;'
                 )
             L.append(
-                f'    const uint16_t r{half} = amdgpu::fp_mode::packed_binary_f16(amdgpu::fp_mode::PackedBinaryOp::{op.upper()}, a_{half}, b_{half}, wf.fp_round_mode_f16_f64(), wf.fp_denorm_mode_f16_f64(), inst_.clamp, wf.fp16_ovfl(), amdgpu::floating_clamp_nan_to_zero(wf));'
+                f'    const uint16_t r{half} = amdgpu::fp_mode::packed_binary_f16(amdgpu::fp_mode::PackedBinaryOp::{op.upper()}, a_{half}, b_{half}, wf.fp_round_mode_f16_f64(), wf.fp_denorm_mode_f16_f64(), inst_.clamp, wf.fp16_ovfl(), amdgpu::floating_clamp_nan_to_zero(wf), wf.cu().arch(), wf.ieee_mode());'
             )
         L.append(
             f'    amdgpu::RegisterAccess(wf).write_lane({d}, lane, rlo | (static_cast<uint32_t>(rhi) << 16));'
@@ -286,7 +286,7 @@ def gen_pk_ternary(
                         f'    if (inst_.{neg} & {1 << index}u) {name}_{half} ^= 0x8000u;'
                     )
                 L.append(
-                    f'    const uint16_t r{half} = amdgpu::fp_mode::packed_select3_f16(amdgpu::fp_mode::PackedBinaryOp::{selection}, first_{half}, second_{half}, third_{half}, wf.fp_denorm_mode_f16_f64(), inst_.clamp, amdgpu::floating_clamp_nan_to_zero(wf));'
+                    f'    const uint16_t r{half} = amdgpu::fp_mode::packed_select3_f16(amdgpu::fp_mode::PackedBinaryOp::{selection}, first_{half}, second_{half}, third_{half}, wf.fp_denorm_mode_f16_f64(), inst_.clamp, amdgpu::floating_clamp_nan_to_zero(wf), wf.cu().arch(), wf.ieee_mode());'
                 )
             L.append(
                 f'    amdgpu::RegisterAccess(wf).write_lane({d}, lane, rlo | (static_cast<uint32_t>(rhi) << 16));'

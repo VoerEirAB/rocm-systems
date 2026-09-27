@@ -7273,6 +7273,9 @@ TEST(Gfx1250AtomicReturnTest, PackedHalfAddPreservesComponentsAcrossMemoryForms)
             ASSERT_NE(inst, nullptr);
             cu.execute_and_route(inst.release(), *wf);
             uint32_t expected = c.expected;
+            // LDS selects the incoming NaN when both operands are NaNs.
+            if (form == Form::Ds && c.old_value == (bf16 ? 0x7fc27fc0u : 0x7e027e00u))
+              expected = bf16 ? 0x7fc47fc0u : 0x7e047e00u;
             if (form == Form::Ds &&
                 ((c.input_denorm && !(denorm & 1u)) || (c.output_denorm && !(denorm & 2u))))
               expected = c.flushed_value;

@@ -165,6 +165,13 @@ struct ImageMetadataAccess {
 
 /// @brief Texel requests and interpolation weights captured at sample issue time.
 struct ImageSampleAccess {
+  struct Comparison {
+    std::array<float, 64> references{};
+    uint32_t function = 0;
+  };
+  std::unique_ptr<Comparison> comparison;
+  bool gather = false;
+  bool horizontal = false;
   static constexpr size_t kMaxFilters = 16;
   /// Two mips, four bilinear taps, and three texels at a cube corner.
   static constexpr size_t kMaxTaps = kMaxFilters * 2 * 4 * 3;
@@ -288,6 +295,9 @@ public:
   /// Older MIN/MAX compare flushed inputs but return the original selected bits.
   /// They also propagate signaling NaNs instead of treating them as missing numbers.
   bool atomic_legacy_minmax = true;
+  /// L2 ADD on qualified RDNA4 targets selects the incoming NaN first.
+  /// Indexed LDS has an independent source-first policy.
+  bool atomic_source_nan_first = false;
   bool lds_dst = false; ///< Buffer load with LDS bit: write to LDS, not VGPRs.
   /// Reference LDS address for LDS-destination loads. For ordinary LDS-dst
   /// paths this may include the lane-0 destination offset. For cluster

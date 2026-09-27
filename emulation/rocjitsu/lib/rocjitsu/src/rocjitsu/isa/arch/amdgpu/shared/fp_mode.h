@@ -382,10 +382,29 @@ enum class PackedBinaryOp { ADD, MUL, MIN, MAX, MINIMUM, MAXIMUM };
 /// @brief Packed F16 binary arithmetic uses the FP16/64 MODE controls.
 inline uint16_t packed_binary_f16(PackedBinaryOp operation, uint16_t a_bits, uint16_t b_bits,
                                   uint32_t round_mode, uint32_t denorm_mode, bool clamp,
-                                  bool fp16_ovfl, bool clamp_nan_to_zero) {
+                                  bool fp16_ovfl, bool clamp_nan_to_zero, rj_code_arch_t arch,
+                                  bool ieee_mode) {
   detail::ScopedFenv nearest_environment(0);
   a_bits = detail::flush_input_f16(a_bits, denorm_mode);
   b_bits = detail::flush_input_f16(b_bits, denorm_mode);
+  const bool a_nan = (a_bits & 0x7fffu) > 0x7c00u;
+  const bool b_nan = (b_bits & 0x7fffu) > 0x7c00u;
+  const bool select = operation == PackedBinaryOp::MIN || operation == PackedBinaryOp::MAX;
+  const bool arithmetic = operation == PackedBinaryOp::ADD || operation == PackedBinaryOp::MUL;
+  if ((select || arithmetic) && (a_nan || b_nan)) {
+    const bool a_signaling = a_nan && !(a_bits & 0x0200u);
+    const bool b_signaling = b_nan && !(b_bits & 0x0200u);
+    const bool signaling_select = select && ieee_mode && arch != ROCJITSU_CODE_ARCH_RDNA4 &&
+                                  arch != ROCJITSU_CODE_ARCH_CDNA5 && (a_signaling || b_signaling);
+    if (arithmetic || (a_nan && b_nan) || signaling_select) {
+      // Select before host arithmetic: host NaN payload priority can change
+      // with inlining or sanitizer instrumentation. Legacy IEEE min/max gives
+      // signaling inputs priority; arithmetic and newer min/max prefer src0.
+      const uint16_t selected = (signaling_select ? a_signaling : a_nan) ? a_bits : b_bits;
+      return clamp && clamp_nan_to_zero ? 0
+                                        : selected | (quiets_nan(arch, ieee_mode) ? 0x0200u : 0u);
+    }
+  }
   const double first = util::f16_to_f32(a_bits);
   const double second = util::f16_to_f32(b_bits);
   double value = std::numeric_limits<double>::quiet_NaN();
@@ -426,10 +445,11 @@ inline uint16_t packed_binary_f16(PackedBinaryOp operation, uint16_t a_bits, uin
 /// @brief Select three packed F16 operands, applying output controls only to the final result.
 inline uint16_t packed_select3_f16(PackedBinaryOp operation, uint16_t first, uint16_t second,
                                    uint16_t third, uint32_t denorm_mode, bool clamp,
-                                   bool clamp_nan_to_zero) {
-  const uint16_t pair =
-      packed_binary_f16(operation, first, second, 0, denorm_mode | 2u, false, false, false);
-  return packed_binary_f16(operation, pair, third, 0, denorm_mode, clamp, false, clamp_nan_to_zero);
+                                   bool clamp_nan_to_zero, rj_code_arch_t arch, bool ieee_mode) {
+  const uint16_t pair = packed_binary_f16(operation, first, second, 0, denorm_mode | 2u, false,
+                                          false, false, arch, ieee_mode);
+  return packed_binary_f16(operation, pair, third, 0, denorm_mode, clamp, false, clamp_nan_to_zero,
+                           arch, ieee_mode);
 }
 
 /// @brief Packed BF16 numeric min/max preserve denormals and order signed zeros explicitly.
@@ -598,7 +618,7 @@ enum class ScalarAtomicOp { FADD, FMIN, FMAX, FCMPSWAP };
 /// @brief Execute scalar floating atomics with explicit ISA policy and bit-preserving selection.
 template <typename Bits>
 Bits atomic_scalar(ScalarAtomicOp operation, Bits old_bits, Bits source_bits, Bits compare_bits,
-                   uint32_t denorm_mode, bool legacy_minmax) {
+                   uint32_t denorm_mode, bool legacy_minmax, bool source_nan_first = false) {
   static_assert(std::is_same_v<Bits, uint32_t> || std::is_same_v<Bits, uint64_t>);
   using Float = std::conditional_t<sizeof(Bits) == 4, float, double>;
   constexpr Bits kSign = Bits{1} << (sizeof(Bits) * 8 - 1);
@@ -624,6 +644,8 @@ Bits atomic_scalar(ScalarAtomicOp operation, Bits old_bits, Bits source_bits, Bi
   if (operation == ScalarAtomicOp::FADD) {
     // DS and cache ADD use fixed RNE, independent of both MODE.round and the host.
     // Select NaNs explicitly so host operand scheduling cannot change payload priority.
+    if (source_nan_first && is_nan(source_input))
+      return source_input | kQuiet;
     if (is_nan(old_input))
       return old_input | kQuiet;
     if (is_nan(source_input))
@@ -668,7 +690,7 @@ Bits atomic_scalar(ScalarAtomicOp operation, Bits old_bits, Bits source_bits, Bi
 /// NaN selection. FP16_OVFL applies to VALU results, not memory atomics. The
 /// caller supplies DS input/output denormal controls, or 3 for no flushing.
 inline uint32_t atomic_add_packed_16(uint32_t old_val, uint32_t src_val, bool bf16,
-                                     uint32_t denorm_mode) {
+                                     uint32_t denorm_mode, bool source_nan_first = false) {
   detail::ScopedFenv nearest_environment(0);
   const uint16_t exponent_mask = bf16 ? 0x7f80u : 0x7c00u;
   auto flush_denorm = [&](uint16_t bits) -> uint16_t {
@@ -687,7 +709,9 @@ inline uint32_t atomic_add_packed_16(uint32_t old_val, uint32_t src_val, bool bf
     uint16_t sum;
     // Float memory add propagates the first NaN, quieting it without changing
     // the sign or payload. Invalid infinity addition produces negative QNaN.
-    if (is_nan(a))
+    if (source_nan_first && is_nan(b))
+      sum = b | quiet_bit;
+    else if (is_nan(a))
       sum = a | quiet_bit;
     else if (is_nan(b))
       sum = b | quiet_bit;

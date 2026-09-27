@@ -378,15 +378,38 @@ class CodeGenerator:
     _DST_OPERANDS_CAPACITY = 3
     _MEMORY_COUNTER_OBLIGATIONS_CAPACITY = 3
 
-    # Supported image sampling modes shared by execution and issue metadata.
-    _IMAGE_SAMPLE_MODES = {
-        'IMAGE_SAMPLE': 'Implicit',
-        'IMAGE_SAMPLE_LZ': 'Zero',
-        'IMAGE_SAMPLE_L': 'Explicit',
-        'IMAGE_SAMPLE_B': 'Bias',
-        'IMAGE_SAMPLE_D': 'Derivatives',
-        'IMAGE_SAMPLE_D_G16': 'Derivatives16',
+    _IMAGE_TRANSFER_MODES = {
+        'IMAGE_LOAD': 'Default',
+        'IMAGE_STORE': 'Default',
+        'IMAGE_LOAD_MIP': 'Mip',
+        'IMAGE_STORE_MIP': 'Mip',
+        'IMAGE_LOAD_PCK': 'Packed',
+        'IMAGE_LOAD_PCK_SGN': 'PackedSigned',
+        'IMAGE_LOAD_MIP_PCK': 'MipPacked',
+        'IMAGE_LOAD_MIP_PCK_SGN': 'MipPackedSigned',
+        'IMAGE_STORE_PCK': 'Packed',
+        'IMAGE_STORE_MIP_PCK': 'MipPacked',
     }
+
+    @staticmethod
+    def _image_sample_mode(name: str) -> str | None:
+        """Share sampler-family recognition between execution and issue metadata."""
+        parts = name.split('_')
+        if parts[:2] not in (
+            ['IMAGE', 'SAMPLE'],
+            ['IMAGE', 'GATHER4'],
+            ['IMAGE', 'GATHER4H'],
+        ):
+            return None
+        mode = '_'.join(part for part in parts[2:] if part not in ('C', 'O', 'CL'))
+        return {
+            '': 'Implicit',
+            'LZ': 'Zero',
+            'L': 'Explicit',
+            'B': 'Bias',
+            'D': 'Derivatives',
+            'D_G16': 'Derivatives16',
+        }.get(mode)
 
     # Memory-pipeline semantics recognized by code generation. This table is
     # also the source of truth for the MEMORY_OP instruction flag: every entry
@@ -406,7 +429,7 @@ class CodeGenerator:
         'global_store_addtid': 'vmem_store',
         'buffer_load': 'vmem_load',
         'buffer_store': 'vmem_store',
-        'image_sample_2d': 'vmem_sample',
+        'image_sample_gfx12': 'vmem_sample',
         'buffer_atomic': 'vmem_atomic',
         'tbuffer_load': 'vmem_load',
         'tbuffer_store': 'vmem_store',
@@ -7809,18 +7832,36 @@ class CodeGenerator:
         # machine-inst fields here. ``vdata`` and ``rsrc`` are field-bearing
         # and already modeled.
         image_name = inst.name.upper()
-        if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4') and image_name in (
-            'IMAGE_LOAD',
-            'IMAGE_LOAD_MIP',
-            'IMAGE_STORE',
-            'IMAGE_GET_LOD',
-            *self._IMAGE_SAMPLE_MODES,
+        if self._is_supported_image_atomic(sem):
+            gfx12 = self.isa_spec.arch_name == 'rdna4'
+            resource = 'inst_.rsrc' if gfx12 else 'inst_.srsrc * 4'
+            unsupported = 'inst_.r128 || inst_.tfe' + (' || inst_.nv' if gfx12 else '')
+            sc0, _, _ = self._coherency_exprs()
+            L = [
+                '  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);',
+                f'  d->is_load = {self._atomic_return_expr(sc0)};',
+                f'  d->atomic_op = {self._ATOMIC_OP_ENUM[sem.operation]};',
+                f'  d->mtype = {self._mtype_expr()};',
+            ]
+            self._append_atomic_fp_policy(L, sem, ds=False)
+            self._append_wait_counter_type(L, sem, 'buffer_atomic')
+            L += [
+                f'  if (!amdgpu::prepare_image_transfer(wf, *d, {resource}, inst_.vdata,',
+                f'      {self._image_coordinates(3)}, inst_.dim, inst_.dmask, inst_.d16,',
+                f'      {unsupported}, ~0u, amdgpu::ImageSampleMode::Implicit, inst_.a16)) return;',
+                '  set_data(std::move(d));',
+            ]
+            return '\n'.join(L)
+        if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4') and (
+            image_name in (*self._IMAGE_TRANSFER_MODES, 'IMAGE_GET_LOD')
+            or self._image_sample_mode(image_name) is not None
         ):
             gfx12 = self.isa_spec.arch_name == 'rdna4'
-            mip_load = image_name == 'IMAGE_LOAD_MIP'
+            transfer_mode = self._IMAGE_TRANSFER_MODES.get(image_name, 'Default')
+            mip_transfer = transfer_mode.startswith('Mip')
             query = image_name == 'IMAGE_GET_LOD'
-            sample = query or image_name in self._IMAGE_SAMPLE_MODES
-            load = image_name != 'IMAGE_STORE'
+            sample = query or self._image_sample_mode(image_name) is not None
+            load = not image_name.startswith('IMAGE_STORE')
             resource = 'inst_.rsrc' if gfx12 else 'inst_.srsrc * 4'
             sampler = 'inst_.samp' if gfx12 else 'inst_.ssamp * 4'
             unsupported = 'inst_.r128 || inst_.tfe'
@@ -7828,12 +7869,7 @@ class CodeGenerator:
                 unsupported += ' || inst_.nv'
             if sample:
                 unsupported += ' || inst_.unorm || inst_.lwe'
-            derivatives = image_name in ('IMAGE_SAMPLE_D', 'IMAGE_SAMPLE_D_G16')
-            coordinate_count = (
-                7
-                if derivatives
-                else 4 if mip_load or sample and (gfx12 or not query) else 3
-            )
+            coordinate_count = 12 if sample else 4 if mip_transfer else 3
             coords = self._image_coordinates(coordinate_count)
             if query:
                 return (
@@ -7843,7 +7879,7 @@ class CodeGenerator:
             counter = (
                 'SAMPLECNT' if sample and gfx12 else 'LOADCNT' if load else 'STORECNT'
             )
-            mode = self._IMAGE_SAMPLE_MODES.get(image_name, 'Implicit')
+            mode = self._image_sample_mode(image_name) or 'Implicit'
             if not sample:
                 sampler = '~0u'
             mtype = (
@@ -7851,7 +7887,27 @@ class CodeGenerator:
                 if gfx12
                 else 'amdgpu::mtype_from_flags_gfx11(inst_.glc, inst_.dlc, inst_.slc)'
             )
-            mip_args = ', nullptr, true' if mip_load else ''
+            transfer_args = (
+                f', nullptr, amdgpu::ImageTransferMode::{transfer_mode}'
+                if transfer_mode != 'Default'
+                else ''
+            )
+            if sample and not query:
+                suffixes = image_name.split('_')[2:]
+                flags = [
+                    ('offset', 'O' in suffixes),
+                    ('compare', 'C' in suffixes),
+                    ('lod_clamp', 'CL' in suffixes),
+                    ('gather', image_name.startswith('IMAGE_GATHER')),
+                    ('horizontal', image_name == 'IMAGE_GATHER4H'),
+                ]
+                enabled = ', '.join(f'.{name} = true' for name, value in flags if value)
+                if enabled:
+                    transfer_args = (
+                        ', nullptr, amdgpu::ImageTransferMode::Default, {'
+                        + enabled
+                        + '}'
+                    )
             return '\n'.join(
                 [
                     '  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);',
@@ -7860,7 +7916,7 @@ class CodeGenerator:
                     f'  d->wait_counter_type = amdgpu::WaitCounterType::{counter};',
                     f'  if (!amdgpu::prepare_image_transfer(wf, *d, {resource}, inst_.vdata,',
                     f'      {coords}, inst_.dim, inst_.dmask, inst_.d16,',
-                    f'      {unsupported}, {sampler}, amdgpu::ImageSampleMode::{mode}, inst_.a16{mip_args})) return;',
+                    f'      {unsupported}, {sampler}, amdgpu::ImageSampleMode::{mode}, inst_.a16{transfer_args})) return;',
                     '  set_data(std::move(d));',
                 ]
             )
@@ -7908,18 +7964,22 @@ class CodeGenerator:
 
         if cls in ('interp', 'lds_direct'):
             if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4'):
-                if inst.name.upper() in ('V_INTERP_P10_F32', 'V_INTERP_P2_F32'):
-                    second = str(inst.name.upper() == 'V_INTERP_P2_F32').lower()
+                if inst.name.upper().startswith(('V_INTERP_P10_', 'V_INTERP_P2_')):
+                    second = str(inst.name.upper().startswith('V_INTERP_P2_')).lower()
+                    half = str('F16' in inst.name.upper()).lower()
+                    rtz = str('RTZ' in inst.name.upper()).lower()
                     opsel = (
                         'inst_.opsel'
                         if self.isa_spec.arch_name == 'rdna4'
                         else 'inst_.op_sel'
                     )
                     return (
-                        '  amdgpu::execute_graphics_interp_f32(wf, inst_.vdst, '
+                        '  amdgpu::execute_graphics_interp(wf, inst_.vdst, '
                         f'{{inst_.src0 - 256u, inst_.src1 - 256u, inst_.src2 - 256u}}, {second}, '
-                        f'inst_.neg, inst_.clamp, {opsel});'
+                        f'inst_.neg, inst_.clamp, {opsel}, {half}, {rtz});'
                     )
+                if inst.name.upper() in ('LDS_DIRECT_LOAD', 'DS_DIRECT_LOAD'):
+                    return '  amdgpu::execute_lds_direct_load(wf, inst_.vdst);'
                 if inst.name.upper() in ('LDS_PARAM_LOAD', 'DS_PARAM_LOAD'):
                     return (
                         '  amdgpu::execute_graphics_parameter_load(wf, inst_.vdst, '
@@ -8285,17 +8345,30 @@ class CodeGenerator:
             )
         return None
 
+    def _is_supported_image_atomic(self, sem: InstructionSemantics | None) -> bool:
+        return (
+            sem is not None
+            and self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4')
+            and sem.semantic_class == 'image_atomic'
+            and sem.operation in self._ATOMIC_OP_ENUM
+        )
+
     def _memory_issue_semantic_class(self, sem: InstructionSemantics) -> str:
         """Return the issue-metadata variant for one decoded instruction."""
-        if self.isa_spec.arch_name == 'rdna4' and sem.name in self._IMAGE_SAMPLE_MODES:
-            return 'image_sample_2d'
-        if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4') and sem.name in (
-            *self._IMAGE_SAMPLE_MODES,
-            'IMAGE_LOAD',
-            'IMAGE_LOAD_MIP',
-            'IMAGE_STORE',
+        if self._is_supported_image_atomic(sem):
+            return 'buffer_atomic'
+        if (
+            self.isa_spec.arch_name == 'rdna4'
+            and self._image_sample_mode(sem.name) is not None
         ):
-            return 'buffer_store' if sem.name == 'IMAGE_STORE' else 'buffer_load'
+            return 'image_sample_gfx12'
+        if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4') and (
+            sem.name in self._IMAGE_TRANSFER_MODES
+            or self._image_sample_mode(sem.name) is not None
+        ):
+            return (
+                'buffer_store' if sem.name.startswith('IMAGE_STORE') else 'buffer_load'
+            )
         if (
             sem.semantic_class == 'ds_barrier_arrive'
             and getattr(sem, 'operation', None) == 'async_barrier_arrive'
@@ -8691,6 +8764,12 @@ class CodeGenerator:
         self, lines: list[str], sem: InstructionSemantics, *, ds: bool
     ) -> None:
         """Carry manual-defined scalar FP policies through deferred memory execution."""
+        if (
+            not ds
+            and self.isa_spec.profile.atomic_source_nan_first
+            and sem.operation in ('fadd', 'pk_add_f16', 'pk_add_bf16')
+        ):
+            lines.append('  d->atomic_source_nan_first = true;')
         if sem.operation not in ('fadd', 'fmin', 'fmax', 'fcmpswap'):
             return
         profile = self.isa_spec.profile
@@ -10449,15 +10528,26 @@ class CodeGenerator:
                             and opnd.operand_type == 'OPR_SREG'
                         ):
                             opnd_size_expr = '32'
+                        if (
+                            self._is_supported_image_atomic(inst_sem)
+                            and opnd.name == 'vdata'
+                        ):
+                            opnd_size_expr = (
+                                '32u * std::popcount(uint32_t{'
+                                'reinterpret_cast<const OpEncoding *>(inst)->dmask})'
+                            )
                         operand_size_exprs[opnd.name] = opnd_size_expr
-                        # Some ISA XMLs describe a buffer atomic's vdata only
+                        # Some ISA XMLs describe an atomic's vdata only
                         # as an output even though it always supplies the
                         # atomic payload. Keep the source dependency
                         # independent of whether the old memory value is
                         # returned.
-                        _is_buffer_atomic_payload = (
+                        _is_atomic_payload = (
                             inst_sem is not None
-                            and inst_sem.semantic_class == 'buffer_atomic'
+                            and (
+                                inst_sem.semantic_class == 'buffer_atomic'
+                                or self._is_supported_image_atomic(inst_sem)
+                            )
                             and opnd.name == 'vdata'
                         )
                         _is_optional_vflat_saddr = (
@@ -10469,7 +10559,7 @@ class CodeGenerator:
                             and opnd.fieldless
                             and opnd.operand_type == 'OPR_FLAT_SCRATCH'
                         )
-                        if (opnd.is_input or _is_buffer_atomic_payload) and not (
+                        if (opnd.is_input or _is_atomic_payload) and not (
                             _is_optional_vflat_saddr or _is_optional_flat_scratch
                         ):
                             opnd_body.append(
@@ -10517,7 +10607,10 @@ class CodeGenerator:
                                     and opnd.name == 'vdst'
                                 )
                                 or (
-                                    inst_sem.semantic_class == 'buffer_atomic'
+                                    (
+                                        inst_sem.semantic_class == 'buffer_atomic'
+                                        or self._is_supported_image_atomic(inst_sem)
+                                    )
                                     and opnd.name == 'vdata'
                                 )
                             )
@@ -10528,7 +10621,10 @@ class CodeGenerator:
                         # liveness does not kill the untouched payload half.
                         _needs_atomic_return_view = (
                             _is_optional_atomic_return
-                            and inst_sem.semantic_class == 'buffer_atomic'
+                            and (
+                                inst_sem.semantic_class == 'buffer_atomic'
+                                or self._is_supported_image_atomic(inst_sem)
+                            )
                             and inst_sem.operation in ('cmpswap', 'fcmpswap')
                             and opnd.name == 'vdata'
                         )
@@ -10665,8 +10761,13 @@ class CodeGenerator:
                                 private_members.append(
                                     cgen.Statement('Operand vdata_return')
                                 )
+                                return_size = (
+                                    f'({opnd_size_expr}) / 2'
+                                    if self._is_supported_image_atomic(inst_sem)
+                                    else str((inst_sem.elem_size or 4) * 8)
+                                )
                                 opnd_ctor_init.append(
-                                    f'vdata_return({(inst_sem.elem_size or 4) * 8}, '
+                                    f'vdata_return({return_size}, '
                                     f'OperandType::{opr_type}, {operand_value})'
                                 )
                                 if _uses_vgpr_msb_roles or _uses_gpr_idx_roles:
@@ -13264,6 +13365,10 @@ class CodeGenerator:
                             False,
                         )
                     )
+                if enc.enc_name.upper() in ('ENC_LDSDIR', 'ENC_VDSDIR'):
+                    cpp_includes.append(
+                        ('rocjitsu/isa/arch/amdgpu/shared/lds_direct.h', False)
+                    )
                 has_matrix_exec = any(
                     self.semantics
                     and (s := self.semantics.instructions.get(i.name))
@@ -14235,6 +14340,7 @@ class CodeGenerator:
             '#include "rocjitsu/isa/arch/amdgpu/shared/gfx11_dot2.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/gfx12_dot.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/graphics_instructions.h"',
+            '#include "rocjitsu/isa/arch/amdgpu/shared/lds_direct.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/division.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/cube.h"',
             '#include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/mul_f32_exec.h"',

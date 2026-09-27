@@ -787,8 +787,9 @@ void GraphicsDraw::initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave
     const uint32_t users = ((sh_[0xb] >> 1) & 31) | ((sh_[0xb] >> 22) & 32);
     for (uint32_t i = 0; i < users; ++i)
       wave.debug_write_sgpr(i, sh_[0xc + i]);
-    // One primitive per wave: all quads share one set of LDS coefficients.
-    wave.debug_write_sgpr(users, wave.lds_base());
+    // One primitive per wave, with parameters at offset zero in its LDS allocation.
+    // Parameter loads add the wave's LDS base to this shader-visible offset.
+    wave.debug_write_sgpr(users, 0);
     for (uint32_t i = 0; i < batch.parameters.size(); ++i)
       wave.lds().write32(wave.lds_base() + i * 4, batch.parameters[i]);
     // Resolve each register only at its original first write, preserving lazy

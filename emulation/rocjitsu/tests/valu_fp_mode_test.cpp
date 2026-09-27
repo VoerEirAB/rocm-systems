@@ -2053,6 +2053,40 @@ TEST(ValuFpModeHelpers, F16FmaFlushesBeforePacking) {
                 sign);
 }
 
+TEST(ValuFpModeHelpers, PackedF16NanSelection) {
+  using namespace amdgpu::fp_mode;
+  // Physical gfx1100/gfx1201 captures, with IEEE disabled/enabled. Entries
+  // give arithmetic and min/max outputs for legacy-off, legacy-on and newer.
+  struct Case {
+    uint16_t a, b;
+    std::array<uint16_t, 3> arithmetic, select;
+  };
+  constexpr Case cases[] = {
+      {0x7fc1, 0xff80, {0x7fc1, 0x7fc1, 0x7fc1}, {0x7fc1, 0x7fc1, 0x7fc1}},
+      {0xff80, 0x7fc1, {0xff80, 0xff80, 0xff80}, {0xff80, 0xff80, 0xff80}},
+      {0x7c01, 0xff80, {0x7c01, 0x7e01, 0x7e01}, {0x7c01, 0x7e01, 0x7e01}},
+      {0x7fc1, 0xfc02, {0x7fc1, 0x7fc1, 0x7fc1}, {0x7fc1, 0xfe02, 0x7fc1}},
+      {0x3c00, 0x7c01, {0x7c01, 0x7e01, 0x7e01}, {0x3c00, 0x7e01, 0x3c00}},
+  };
+  for (auto arch : {ROCJITSU_CODE_ARCH_RDNA3, ROCJITSU_CODE_ARCH_RDNA4})
+    for (bool ieee : {false, true}) {
+      const unsigned profile = arch == ROCJITSU_CODE_ARCH_RDNA4 ? 2 : unsigned(ieee);
+      for (auto op :
+           {PackedBinaryOp::ADD, PackedBinaryOp::MUL, PackedBinaryOp::MIN, PackedBinaryOp::MAX})
+        for (const auto &test : cases) {
+          SCOPED_TRACE(::testing::Message() << int(arch) << ':' << ieee << ':' << int(op) << ':'
+                                            << test.a << ':' << test.b);
+          const uint16_t expected =
+              (op == PackedBinaryOp::ADD || op == PackedBinaryOp::MUL ? test.arithmetic
+                                                                      : test.select)[profile];
+          EXPECT_EQ(packed_binary_f16(op, test.a, test.b, 0, 3, false, false, false, arch, ieee),
+                    expected);
+          EXPECT_EQ(packed_binary_f16(op, test.a, test.b, 0, 3, true, false, true, arch, ieee),
+                    expected > 0x7c00u ? 0 : 0x3c00u);
+        }
+    }
+}
+
 TEST(ValuFpModeHelpers, FusedResultAndOutputFlush) {
   using amdgpu::fp_mode::Arithmetic;
   EXPECT_EQ(std::bit_cast<uint32_t>(amdgpu::fp_mode::arithmetic<Arithmetic::FMA>(
