@@ -5428,18 +5428,118 @@ TEST_P(GraphicsExportTest, UnsupportedComparisonSamplingReportsAnExecutionError)
             amdgpu::InstructionExecutionError::UnimplementedInstruction);
 }
 
-TEST_P(GraphicsExportTest, UnsupportedMipImageLoadReportsAnExecutionError) {
-  std::array<uint32_t, 4> words{};
-  if (GetParam() == ROCJITSU_CODE_ARCH_RDNA4) {
-    const auto load = rdna4::build_vimage(1, {.dmask = 1}); // IMAGE_LOAD_MIP
-    std::copy(load.begin(), load.end(), words.begin());
-  } else {
-    const auto load = rdna3::build_mimg(1, {.dmask = 1}); // IMAGE_LOAD_MIP
-    std::copy(load.begin(), load.end(), words.begin());
+TEST_P(GraphicsExportTest, ExplicitMipLoadsUsePerLaneViewRelativeCoordinates) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  constexpr uint32_t base = 0x600000;
+  // Physical GFX11/12 captures: 48-wide linear RGBA8 mip offsets are
+  // 768, 512, 256, 0. Large unsigned LODs return zero, without wrapping.
+  constexpr uint32_t lods[] = {0, 1, 2, 3, 4, 15, 16, 31, 32, 255, 256, 65535, 65536, ~0u};
+  for (uint32_t layer = 0; layer < 4; ++layer)
+    for (uint32_t i = 0; i < 256; ++i)
+      memory_.write32(base + layer * 1024 + i * 4, 0x44000000 | (layer << 16) | i);
+  for (uint8_t dim : {0, 1, 4, 5}) {
+    const bool array = dim >= 4;
+    const uint32_t components = (dim == 0 ? 1 : dim == 5 ? 3 : 2);
+    for (uint32_t first = 0; first < 3; ++first)
+      for (bool a16 : {false, true})
+        for (bool d16 : {false, true}) {
+          SCOPED_TRACE(testing::Message() << "dim=" << unsigned(dim) << " first=" << first
+                                          << " a16=" << a16 << " d16=" << d16);
+          std::array<uint32_t, 8> descriptor{base >> 8,
+                                             (46u << (gfx12 ? 17 : 20)) | (3u << 30) |
+                                                 (3u << (gfx12 ? 12 : 16)),
+                                             11,
+                                             ((dim == 0   ? 8u
+                                               : dim == 1 ? 9u
+                                               : dim == 4 ? 12u
+                                                          : 13u)
+                                              << 28) |
+                                                 0xfac,
+                                             array ? (1u << 16) | 2u : 0,
+                                             0,
+                                             0,
+                                             0};
+          if (gfx12) {
+            descriptor[1] |= first << 25;
+            descriptor[3] |= 2u << 15;
+          } else {
+            descriptor[3] |= (first << 12) | (2u << 16);
+          }
+          for (uint32_t i = 0; i < descriptor.size(); ++i)
+            wave_->debug_write_sgpr(8 + i, descriptor[i]);
+          wave_->set_exec((1u << 28) - 1);
+          constexpr uint32_t coords[] = {2, 6, 7, 5};
+          for (uint32_t lane = 0; lane < 29; ++lane) {
+            const bool outside_layer = array && lane == 27;
+            std::array<uint32_t, 4> address{lane < 14 || outside_layer ? 0u : 12u};
+            if (array)
+              address[components - 1] = lane == 27 ? 2 : lane % 2;
+            address[components] = outside_layer ? 0 : lods[lane % 14];
+            for (uint32_t i = 0; i < 4; ++i)
+              wave_->debug_write_vgpr(
+                  coords[i], lane,
+                  a16 ? i < 2 ? (address[2 * i] & 0xffff) | (address[2 * i + 1] << 16) : 0
+                      : address[i]);
+            for (uint32_t i = 0; i < 4; ++i)
+              wave_->debug_write_vgpr(8 + i, lane, 0xdeadbeef);
+          }
+          std::array<uint32_t, 4> words{};
+          if (gfx12) {
+            const auto encoded = rdna4::build_vimage(1, {.dim = dim,
+                                                         .d16 = d16,
+                                                         .a16 = a16,
+                                                         .dmask = 15,
+                                                         .vdata = 8,
+                                                         .rsrc = 8,
+                                                         .vaddr0 = 2,
+                                                         .vaddr1 = 6,
+                                                         .vaddr2 = 7,
+                                                         .vaddr3 = 5});
+            std::copy(encoded.begin(), encoded.end(), words.begin());
+          } else {
+            const auto encoded = rdna3::build_mimg(1, {.nsa = 1,
+                                                       .dim = dim,
+                                                       .dmask = 15,
+                                                       .a16 = a16,
+                                                       .d16 = d16,
+                                                       .vaddr = 2,
+                                                       .vdata = 8,
+                                                       .srsrc = 2});
+            std::copy(encoded.begin(), encoded.end(), words.begin());
+            words[2] = 6 | (7u << 8) | (5u << 16);
+          }
+          auto decoded = decoder_->decode(words.data());
+          ASSERT_FALSE(decoded.failed());
+          auto instruction = std::move(decoded).value();
+          const auto *issue = instruction->amdgpu_memory_issue_info();
+          ASSERT_NE(issue, nullptr);
+          const auto obligations = issue->counter_obligations();
+          ASSERT_EQ(obligations.size(), 1u);
+          EXPECT_EQ(obligations[0].wait_counter_type(), amdgpu::WaitCounterType::LOADCNT);
+          EXPECT_EQ(obligations[0].completion_class(), amdgpu::MemoryCompletionClass::VMEM);
+          ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
+          ASSERT_FALSE(wave_->instruction_execution_failed());
+          ASSERT_NE(instruction->data(), nullptr);
+          amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+          pipeline.issue(instruction.release(), *wave_);
+          for (uint32_t lane = 0; lane < 28; ++lane) {
+            const bool outside_layer = array && lane == 27;
+            const uint32_t lod = outside_layer ? 0 : lods[lane % 14] & (a16 ? 0xffffu : ~0u);
+            const uint32_t x = lane < 14 || outside_layer ? 0 : 12;
+            const bool valid = lod <= 2 - first && x < (48u >> (first + lod)) && !outside_layer;
+            const uint32_t value = valid ? 0x44000000 | ((array ? 1 + lane % 2 : 0) << 16) |
+                                               ((3 - first - lod) * 64 + x)
+                                         : 0;
+            for (uint32_t c = 0; c < (d16 ? 2u : 4u); ++c) {
+              const uint32_t expected =
+                  d16 ? ((value >> (16 * c)) & 255) | (((value >> (16 * c + 8)) & 255) << 16)
+                      : (value >> (8 * c)) & 255;
+              EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), expected) << "lane=" << lane;
+            }
+          }
+          EXPECT_EQ(wave_->debug_read_vgpr(8, 28), 0xdeadbeefu);
+        }
   }
-  run(words);
-  EXPECT_EQ(wave_->instruction_execution_error(),
-            amdgpu::InstructionExecutionError::UnimplementedInstruction);
 }
 
 TEST_P(GraphicsExportTest, LinearMipLevelsUseReverseAllocationOrder) {
@@ -5541,95 +5641,106 @@ TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOf
   for (bool compressed : {false, true}) {
     if (gfx12 && compressed)
       continue;
-    for (uint32_t level = 0; level < 8; ++level) {
-      SCOPED_TRACE(level);
-      const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
-      std::array<uint32_t, 8> descriptor{base >> 8,
-                                         (46u << (gfx12 ? 17 : 20)) | (3u << 30) |
-                                             (7u << (gfx12 ? 12 : 16)),
-                                         49u | (179u << 14),
-                                         (9u << 28) | ((gfx12 ? 3u : 27u) << 20) | 0xfac,
-                                         0,
-                                         0,
-                                         0,
-                                         0};
-      if (gfx12) {
-        descriptor[1] |= level << 25;
-        descriptor[3] |= 7u << 15;
-      } else {
-        descriptor[3] |= (level << 12) | (7u << 16);
-      }
-      constexpr uint64_t metadata = 0x200000;
-      // AddrLib: 200x180 R_X has three DCC blocks; tail levels after mip 2
-      // cannot use metadata. Seed the first byte of every block independently.
-      if (compressed) {
-        descriptor[6] = (1u << 21) | (1u << 19);
-        descriptor[7] = metadata >> 16;
-      }
-      const uint64_t tag = *amdgpu::gfx11_metadata_address(
-          metadata + (2 - std::min(level, 2u)) * 16384, width - 1, height - 1,
-          (200 + (1u << level) - 1) >> level, (180 + (1u << level) - 1) >> level, 4, 27, false);
-      memory_.write8(tag, 2);
-      for (uint32_t r = 0; r < descriptor.size(); ++r)
-        wave_->debug_write_sgpr(8 + r, descriptor[r]);
-      wave_->set_exec(15);
-      for (uint32_t lane = 0; lane < 4; ++lane) {
-        wave_->debug_write_vgpr(2, lane, lane == 1 ? width : lane == 3 ? ~0u : width - 1);
-        wave_->debug_write_vgpr(3, lane, lane == 2 ? height : height - 1);
-      }
-      const uint32_t address = base + kMipLastTexelOffsets[gfx12][level];
-      memory_.write32(address, 0x44332211);
-      amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
-      for (bool store : {false, true}) {
-        // The load has expanded this block. Exercise a store directly into a
-        // different compressed clear, including the first packed-tail mip.
-        if (store && compressed && level <= 2)
-          memory_.write8(tag, 8);
-        std::array<uint32_t, 4> words{};
+    for (bool explicit_mip : {false, true})
+      for (uint32_t level = 0; level < 8; ++level) {
+        SCOPED_TRACE(testing::Message() << "level=" << level << " explicit=" << explicit_mip);
+        const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
+        std::array<uint32_t, 8> descriptor{base >> 8,
+                                           (46u << (gfx12 ? 17 : 20)) | (3u << 30) |
+                                               (7u << (gfx12 ? 12 : 16)),
+                                           49u | (179u << 14),
+                                           (9u << 28) | ((gfx12 ? 3u : 27u) << 20) | 0xfac,
+                                           0,
+                                           0,
+                                           0,
+                                           0};
         if (gfx12) {
-          const auto inst = rdna4::build_vimage(
-              store ? 6 : 0,
-              {.dim = 1, .dmask = 15, .vdata = 8, .rsrc = 8, .vaddr0 = 2, .vaddr1 = 3});
-          std::copy(inst.begin(), inst.end(), words.begin());
+          descriptor[1] |= level << 25;
+          descriptor[3] |= 7u << 15;
         } else {
-          const auto inst = rdna3::build_mimg(
-              store ? 6 : 0, {.dim = 1, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2});
-          std::copy(inst.begin(), inst.end(), words.begin());
+          descriptor[3] |= (level << 12) | (7u << 16);
         }
-        auto decoded = decoder_->decode(words.data());
-        ASSERT_FALSE(decoded.failed());
-        auto instruction = std::move(decoded).value();
-        ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
-        ASSERT_FALSE(wave_->instruction_execution_failed());
-        ASSERT_NE(instruction->data(), nullptr);
-        const auto *transfer = instruction->data_as<amdgpu::VectorMemState>();
-        EXPECT_EQ(transfer->per_lane_addr[0], address);
-        EXPECT_EQ(transfer->lane_mask, 1u);
-        pipeline.issue(instruction.release(), *wave_);
-        if (!store) {
-          for (uint32_t c = 0; c < 4; ++c) {
-            EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0),
-                      compressed && level <= 2 ? 255u : 0x11u * (c + 1));
-            for (uint32_t lane = 1; lane < 4; ++lane)
-              EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), 0u);
-            wave_->debug_write_vgpr(8 + c, 0, 0x80u + c);
+        constexpr uint64_t metadata = 0x200000;
+        // AddrLib: 200x180 R_X has three DCC blocks; tail levels after mip 2
+        // cannot use metadata. Seed the first byte of every block independently.
+        if (compressed) {
+          descriptor[6] = (1u << 21) | (1u << 19);
+          descriptor[7] = metadata >> 16;
+        }
+        const uint64_t tag = *amdgpu::gfx11_metadata_address(
+            metadata + (2 - std::min(level, 2u)) * 16384, width - 1, height - 1,
+            (200 + (1u << level) - 1) >> level, (180 + (1u << level) - 1) >> level, 4, 27, false);
+        memory_.write8(tag, 2);
+        for (uint32_t r = 0; r < descriptor.size(); ++r)
+          wave_->debug_write_sgpr(8 + r, descriptor[r]);
+        wave_->set_exec(15);
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+          wave_->debug_write_vgpr(2, lane, lane == 1 ? width : lane == 3 ? ~0u : width - 1);
+          wave_->debug_write_vgpr(3, lane, lane == 2 ? height : height - 1);
+          wave_->debug_write_vgpr(4, lane, level);
+        }
+        const uint32_t address = base + kMipLastTexelOffsets[gfx12][level];
+        memory_.write32(address, 0x44332211);
+        amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+        for (bool store : {false, true}) {
+          // The load has expanded this block. Exercise a store directly into a
+          // different compressed clear, including the first packed-tail mip.
+          if (store && compressed && level <= 2)
+            memory_.write8(tag, 8);
+          const uint32_t first = explicit_mip && !store ? 0 : level;
+          wave_->debug_write_sgpr(gfx12 ? 9 : 11,
+                                  gfx12 ? (descriptor[1] & ~(31u << 25)) | (first << 25)
+                                        : (descriptor[3] & ~(15u << 12)) | (first << 12));
+          const uint8_t opcode = store ? 6 : explicit_mip ? 1 : 0;
+          std::array<uint32_t, 4> words{};
+          if (gfx12) {
+            const auto inst = rdna4::build_vimage(opcode, {.dim = 1,
+                                                           .dmask = 15,
+                                                           .vdata = 8,
+                                                           .rsrc = 8,
+                                                           .vaddr0 = 2,
+                                                           .vaddr1 = 3,
+                                                           .vaddr2 = 4});
+            std::copy(inst.begin(), inst.end(), words.begin());
+          } else {
+            const auto inst = rdna3::build_mimg(
+                opcode, {.dim = 1, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2});
+            std::copy(inst.begin(), inst.end(), words.begin());
+          }
+          auto decoded = decoder_->decode(words.data());
+          ASSERT_FALSE(decoded.failed());
+          auto instruction = std::move(decoded).value();
+          ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
+          ASSERT_FALSE(wave_->instruction_execution_failed());
+          ASSERT_NE(instruction->data(), nullptr);
+          const auto *transfer = instruction->data_as<amdgpu::VectorMemState>();
+          EXPECT_EQ(transfer->per_lane_addr[0], address);
+          EXPECT_EQ(transfer->lane_mask, 1u);
+          pipeline.issue(instruction.release(), *wave_);
+          if (!store) {
+            for (uint32_t c = 0; c < 4; ++c) {
+              EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0),
+                        compressed && level <= 2 ? 255u : 0x11u * (c + 1));
+              for (uint32_t lane = 1; lane < 4; ++lane)
+                EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), 0u);
+              wave_->debug_write_vgpr(8 + c, 0, 0x80u + c);
+            }
           }
         }
+        cu_->l1_vector().flush_all();
+        cache_.flush_all();
+        EXPECT_EQ(memory_.read32(address), 0x83828180u);
+        if (compressed && level <= 2) {
+          const auto mip = amdgpu::image_mip_layout(false, 27, 4, 200, 180, 8, level);
+          ASSERT_TRUE(mip);
+          const auto neighbor =
+              amdgpu::gfx11_image_address(base + mip->offset, width - 2 + mip->tail_x,
+                                          height - 1 + mip->tail_y, mip->pitch, 4, 27);
+          ASSERT_TRUE(neighbor);
+          EXPECT_EQ(memory_.read32(*neighbor), 0xff000000u);
+        }
+        EXPECT_EQ(memory_.read8(tag), compressed && level <= 2 ? 255 : 2);
       }
-      cu_->l1_vector().flush_all();
-      cache_.flush_all();
-      EXPECT_EQ(memory_.read32(address), 0x83828180u);
-      if (compressed && level <= 2) {
-        const auto mip = amdgpu::image_mip_layout(false, 27, 4, 200, 180, 8, level);
-        ASSERT_TRUE(mip);
-        const auto neighbor =
-            amdgpu::gfx11_image_address(base + mip->offset, width - 2 + mip->tail_x,
-                                        height - 1 + mip->tail_y, mip->pitch, 4, 27);
-        ASSERT_TRUE(neighbor);
-        EXPECT_EQ(memory_.read32(*neighbor), 0xff000000u);
-      }
-      EXPECT_EQ(memory_.read8(tag), compressed && level <= 2 ? 255 : 2);
-    }
   }
 }
 

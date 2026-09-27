@@ -41,7 +41,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
                                    uint32_t mask, bool d16, bool unsupported_flags,
                                    uint32_t sampler = ~0u,
                                    ImageSampleMode sample_mode = ImageSampleMode::Implicit,
-                                   bool a16 = false, ImageLodResults *queried_lods = nullptr) {
+                                   bool a16 = false, ImageLodResults *queried_lods = nullptr,
+                                   bool mip_load = false) {
   const auto unsupported = [&] {
     wf.report_instruction_execution_error(InstructionExecutionError::UnsupportedOperandValue);
     return false;
@@ -106,7 +107,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   // only the levels selected by this instruction, once per level.
   std::array<std::optional<ImageMipLayout>, 32> mip_layouts{};
   mip_layouts[first_level] = mip;
-  const auto sample_mip_layout = [&](uint32_t level) -> const std::optional<ImageMipLayout> & {
+  const auto get_mip_layout = [&](uint32_t level) -> const std::optional<ImageMipLayout> & {
     auto &layout = mip_layouts[level];
     if (!layout)
       layout = image_mip_layout(gfx12, swizzle, bytes, resource_width, resource_height,
@@ -222,7 +223,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     return unsupported();
   const uint32_t body_components =
       2 + (dim == 5 || dim == 3) + (sample_mode == ImageSampleMode::Explicit);
-  const uint32_t load_components = dim == 5 ? 3 : dim == 0 ? 1 : 2;
+  const uint32_t load_components = (dim == 5 ? 3 : dim == 0 ? 1 : 2) + mip_load;
   const uint32_t coordinate_count =
       !sample ? (a16 ? (load_components + 1) / 2 : load_components)
               : coordinate_offset + (a16 ? (body_components + 1) / 2 : body_components);
@@ -463,7 +464,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         }
         return static_cast<uint32_t>(value);
       };
-      const auto &lane_mip = sample_mip_layout(level);
+      const auto &lane_mip = get_mip_layout(level);
       if (!lane_mip)
         return unsupported();
       const uint64_t resource_base = base - mip->offset;
@@ -493,7 +494,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
           const uint32_t source = filter_tap % access.texels_per_tap;
           const uint32_t texel = filter_tap / access.texels_per_tap;
           const uint32_t mip_index = texel / 4;
-          const auto &selected = sample_mip_layout(std::min(level + mip_index, last_level));
+          const auto &selected = get_mip_layout(std::min(level + mip_index, last_level));
           if (!selected)
             return unsupported();
           // All taps in a footprint share its center. Each mip also shares
@@ -603,22 +604,34 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
                                                : 0;
     if (!is_array && relative_layer)
       return unsupported();
-    if (x >= width || y >= height || (is_array && relative_layer > last_layer - first_layer))
+    // IMAGE_LOAD_MIP supplies an unsigned, view-relative LOD per lane.
+    // Reject it before adding the base level, including values that would wrap.
+    const uint32_t relative_level = mip_load ? load_coordinate(load_components - 1) : 0;
+    if (relative_level > last_level - first_level)
+      continue;
+    const uint32_t level = first_level + relative_level;
+    const auto &selected = get_mip_layout(level);
+    if (!selected)
+      return unsupported();
+    if (x >= selected->width || y >= selected->height ||
+        (is_array && relative_layer > last_layer - first_layer))
       continue;
     const uint32_t layer = is_array ? first_layer + relative_layer : 0;
-    const uint64_t layer_base =
-        image_layer_base(gfx12, base, mip->slice_size, layer, bytes, swizzle);
-    const auto address = gfx12 ? gfx12_image_address(layer_base, x + mip->tail_x, y + mip->tail_y,
-                                                     pitch, bytes, swizzle)
-                               : gfx11_image_address(layer_base, x + mip->tail_x, y + mip->tail_y,
-                                                     pitch, bytes, swizzle);
+    const uint64_t layer_base = image_layer_base(gfx12, base - mip->offset + selected->offset,
+                                                 selected->slice_size, layer, bytes, swizzle);
+    const uint32_t selected_pitch = level == first_level ? pitch : selected->pitch;
+    const auto address =
+        gfx12 ? gfx12_image_address(layer_base, x + selected->tail_x, y + selected->tail_y,
+                                    selected_pitch, bytes, swizzle)
+              : gfx11_image_address(layer_base, x + selected->tail_x, y + selected->tail_y,
+                                    selected_pitch, bytes, swizzle);
     if (!address)
       return unsupported();
     d.per_lane_addr[lane] = *address;
     if (d.image_metadata) {
       d.image_metadata->coordinates[lane] = x | (y << 16);
       d.image_metadata->layers[lane] = layer;
-      d.image_metadata->levels[lane] = first_level;
+      d.image_metadata->levels[lane] = level;
     }
     d.lane_mask |= uint64_t{1} << lane;
   }

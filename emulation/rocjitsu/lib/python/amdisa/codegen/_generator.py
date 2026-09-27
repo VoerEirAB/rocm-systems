@@ -7811,11 +7811,13 @@ class CodeGenerator:
         image_name = inst.name.upper()
         if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4') and image_name in (
             'IMAGE_LOAD',
+            'IMAGE_LOAD_MIP',
             'IMAGE_STORE',
             'IMAGE_GET_LOD',
             *self._IMAGE_SAMPLE_MODES,
         ):
             gfx12 = self.isa_spec.arch_name == 'rdna4'
+            mip_load = image_name == 'IMAGE_LOAD_MIP'
             query = image_name == 'IMAGE_GET_LOD'
             sample = query or image_name in self._IMAGE_SAMPLE_MODES
             load = image_name != 'IMAGE_STORE'
@@ -7828,7 +7830,9 @@ class CodeGenerator:
                 unsupported += ' || inst_.unorm || inst_.lwe'
             derivatives = image_name in ('IMAGE_SAMPLE_D', 'IMAGE_SAMPLE_D_G16')
             coordinate_count = (
-                7 if derivatives else 4 if sample and (gfx12 or not query) else 3
+                7
+                if derivatives
+                else 4 if mip_load or sample and (gfx12 or not query) else 3
             )
             coords = self._image_coordinates(coordinate_count)
             if query:
@@ -7847,6 +7851,7 @@ class CodeGenerator:
                 if gfx12
                 else 'amdgpu::mtype_from_flags_gfx11(inst_.glc, inst_.dlc, inst_.slc)'
             )
+            mip_args = ', nullptr, true' if mip_load else ''
             return '\n'.join(
                 [
                     '  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);',
@@ -7855,7 +7860,7 @@ class CodeGenerator:
                     f'  d->wait_counter_type = amdgpu::WaitCounterType::{counter};',
                     f'  if (!amdgpu::prepare_image_transfer(wf, *d, {resource}, inst_.vdata,',
                     f'      {coords}, inst_.dim, inst_.dmask, inst_.d16,',
-                    f'      {unsupported}, {sampler}, amdgpu::ImageSampleMode::{mode}, inst_.a16)) return;',
+                    f'      {unsupported}, {sampler}, amdgpu::ImageSampleMode::{mode}, inst_.a16{mip_args})) return;',
                     '  set_data(std::move(d));',
                 ]
             )
@@ -8287,6 +8292,7 @@ class CodeGenerator:
         if self.isa_spec.arch_name in ('rdna3', 'rdna3_5', 'rdna4') and sem.name in (
             *self._IMAGE_SAMPLE_MODES,
             'IMAGE_LOAD',
+            'IMAGE_LOAD_MIP',
             'IMAGE_STORE',
         ):
             return 'buffer_store' if sem.name == 'IMAGE_STORE' else 'buffer_load'

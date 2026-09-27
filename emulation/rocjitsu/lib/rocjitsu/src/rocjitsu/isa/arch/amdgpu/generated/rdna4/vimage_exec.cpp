@@ -40,8 +40,16 @@ void ImageLoadVimage::execute_impl(amdgpu::Wavefront &wf) {
 }
 
 void ImageLoadMipVimage::execute_impl(amdgpu::Wavefront &wf) {
-  wf.report_instruction_execution_error(
-      amdgpu::InstructionExecutionError::UnimplementedInstruction);
+  auto d = std::make_unique<amdgpu::VectorMemState>(amdgpu::GLOBAL_MEM);
+  d->is_load = true;
+  d->mtype = amdgpu::mtype_from_flags_gfx12(inst_.scope, inst_.th);
+  d->wait_counter_type = amdgpu::WaitCounterType::LOADCNT;
+  if (!amdgpu::prepare_image_transfer(
+          wf, *d, inst_.rsrc, inst_.vdata, {inst_.vaddr0, inst_.vaddr1, inst_.vaddr2, inst_.vaddr3},
+          inst_.dim, inst_.dmask, inst_.d16, inst_.r128 || inst_.tfe || inst_.nv, ~0u,
+          amdgpu::ImageSampleMode::Implicit, inst_.a16, nullptr, true))
+    return;
+  set_data(std::move(d));
 }
 
 void ImageLoadPckVimage::execute_impl(amdgpu::Wavefront &wf) {
