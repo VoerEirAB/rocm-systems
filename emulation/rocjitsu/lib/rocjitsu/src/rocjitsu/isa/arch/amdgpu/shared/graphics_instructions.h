@@ -26,6 +26,7 @@ inline void execute_graphics_interp_f32(Wavefront &wf, uint32_t dst, std::array<
   }
   RegisterAccess regs(wf);
   const uint32_t base = wf.vgpr_alloc().base;
+  std::array<std::array<float, 3>, 64> inputs{};
   std::array<uint32_t, 64> result{};
   for (uint32_t lane = 0; lane < wf.wf_size(); ++lane) {
     if (!(wf.exec() & (uint64_t{1} << lane)))
@@ -35,10 +36,17 @@ inline void execute_graphics_interp_f32(Wavefront &wf, uint32_t dst, std::array<
       const uint32_t value = regs.read_vgpr(base + src[operand], source_lane);
       return std::bit_cast<float>(value ^ (((neg >> operand) & 1u) << 31));
     };
-    result[lane] = fp_mode::packed_f32(read(0, quad + (second ? 2 : 1)), read(1, lane),
-                                       read(2, second ? lane : quad), fp_mode::PackedF32Op::FMA,
-                                       wf.fp_round_mode_f32(), wf.fp_denorm_mode_f32(), clamp, true,
-                                       wf.cu().arch(), wf.ieee_mode());
+    inputs[lane] = {read(0, quad + (second ? 2 : 1)), read(1, lane), read(2, second ? lane : quad)};
+  }
+  // Register observers retain the caller's environment. Only arithmetic shares
+  // the instruction's temporary FP environment across active lanes.
+  {
+    fp_mode::ScopedEnvironment environment(wf.fp_round_mode_f32());
+    for (uint32_t lane = 0; lane < wf.wf_size(); ++lane)
+      if (wf.exec() & (uint64_t{1} << lane))
+        result[lane] = fp_mode::detail::packed_f32_environment(
+            inputs[lane][0], inputs[lane][1], inputs[lane][2], fp_mode::PackedF32Op::FMA,
+            wf.fp_denorm_mode_f32(), clamp, true, wf.cu().arch(), wf.ieee_mode());
   }
   // Snapshot every quad's inputs before writing: destination may alias P0/P10/P20.
   for (uint32_t lane = 0; lane < wf.wf_size(); ++lane)

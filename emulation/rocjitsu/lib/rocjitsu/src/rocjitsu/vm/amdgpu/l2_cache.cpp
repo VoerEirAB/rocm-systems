@@ -220,9 +220,10 @@ VmAccessOutcome L2Cache::access_outcome(simdojo::MessageStatus status) {
 bool L2Cache::can_fetch_range(uint64_t addr, uint32_t size, uint32_t vmid) const {
   if (vmid == 0 || gpu_vm_ == nullptr)
     return true;
-  const std::optional<GpuVmAccess> vm_access = gpu_vm_->snapshot_vmid(vmid);
-  return vm_access &&
-         vm_access->query_access(addr, size, VmAccessKind::Read) == VmAccessOutcome::Complete;
+  return gpu_vm_->with_vmid_snapshot(vmid, [&](const GpuVmAccess *vm_access) {
+    return vm_access &&
+           vm_access->query_access(addr, size, VmAccessKind::Read) == VmAccessOutcome::Complete;
+  });
 }
 
 VmAccessOutcome L2Cache::send_backing(uint64_t addr, uint8_t *data, uint32_t size,
@@ -246,14 +247,13 @@ VmAccessOutcome L2Cache::send_backing(uint64_t addr, uint8_t *data, uint32_t siz
     }
     if (gpu_vm_ == nullptr)
       return VmAccessOutcome::Unavailable;
-    std::optional<GpuVmAccess> vm_access = gpu_vm_->snapshot_vmid(vmid);
-    if (!vm_access)
-      return VmAccessOutcome::Faulted;
-    const VmAccessOutcome outcome =
-        op == simdojo::MessageOp::WRITE
-            ? vm_access->write(addr, std::as_bytes(std::span<const uint8_t>(data, size)))
-            : vm_access->read(addr, std::as_writable_bytes(std::span<uint8_t>(data, size)));
-    return outcome;
+    return gpu_vm_->with_vmid_snapshot(vmid, [&](const GpuVmAccess *vm_access) {
+      if (!vm_access)
+        return VmAccessOutcome::Faulted;
+      return op == simdojo::MessageOp::WRITE
+                 ? vm_access->write(addr, std::as_bytes(std::span<const uint8_t>(data, size)))
+                 : vm_access->read(addr, std::as_writable_bytes(std::span<uint8_t>(data, size)));
+    });
   }
   assert(req_port_ != nullptr && "L2Cache: req_port_ not set");
   if (req_port_->link() == nullptr ||
@@ -396,6 +396,30 @@ VmAccessOutcome L2Cache::cache_partial_bytes(uint64_t addr, const uint8_t *src, 
   return VmAccessOutcome::Complete;
 }
 
+bool L2Cache::try_read_scalar_ram(uint64_t addr, uint32_t *dst, uint32_t num_dwords,
+                                  uint32_t vmid) {
+  if (!backing_memory_ || !gpu_vm_ || vmid == 0 || num_dwords < 2 || num_dwords > 16 ||
+      (addr & 3) || num_dwords * 4 > 64 - (addr & 63))
+    return false;
+  // Discover the snapshot before cache admission: a cold quantum snapshot may
+  // allocate its retained entry. The optional copy itself cannot allocate.
+  return gpu_vm_->with_vmid_snapshot(vmid, [&](const GpuVmAccess *access) {
+    if (!access)
+      return false;
+    auto maintenance_lock = acquire_cache_access();
+    std::lock_guard set_lock(set_mutex(addr));
+    // Resident lines retain the existing flush/fault path. A miss neither
+    // updates replacement state nor publishes or invalidates cached bytes.
+    if (cache_.lookup(addr, nullptr, vmid))
+      return false;
+    const bool copied =
+        access->try_read_uncached_ram(addr, std::as_writable_bytes(std::span(dst, num_dwords)));
+    if (copied)
+      backing_read_transactions_.fetch_add(1, std::memory_order_relaxed);
+    return copied;
+  });
+}
+
 VmAccessOutcome L2Cache::read(uint64_t addr, uint8_t *dst, uint32_t size, Mtype mtype,
                               uint32_t vmid) {
   auto maintenance_lock = acquire_cache_access();
@@ -462,6 +486,43 @@ VmAccessOutcome L2Cache::read(uint64_t addr, uint8_t *dst, uint32_t size, Mtype 
     copied += chunk;
   }
   return VmAccessOutcome::Complete;
+}
+
+bool L2Cache::try_write_private_dwords(std::span<const VmRamDwordStore> stores,
+                                       Mtype instruction_mtype, Mtype mtype, uint32_t vmid) {
+  if (!backing_memory_ || !gpu_vm_ || !vmid || stores.size() < 2 ||
+      stores.size() > VmRamDwordStore::kMaxBatch)
+    return false;
+  const uint64_t address = stores.front().address;
+  for (const auto &store : stores)
+    if ((store.address & 3) ||
+        CacheStore::line_address(store.address) != CacheStore::line_address(address))
+      return false;
+  // A cold snapshot can allocate retained storage; prepare it before cache admission.
+  return gpu_vm_->with_vmid_snapshot(vmid, [&](const GpuVmAccess *access) {
+    if (!access)
+      return false;
+    auto maintenance_lock = acquire_cache_access();
+    std::lock_guard set_lock(set_mutex(address));
+    const auto *resident = cache_.peek(address, vmid);
+    if (mtype == Mtype::UC ? resident != nullptr : !resident || resident->dirty)
+      return false;
+    if (!access->try_write_private_dwords(stores, instruction_mtype, mtype))
+      return false;
+    backing_write_transactions_.fetch_add(stores.size(), std::memory_order_relaxed);
+    if (mtype != Mtype::UC) {
+      for (const auto &store : stores) {
+        simdojo::CacheTag *tag = nullptr;
+        cache_.lookup(store.address, &tag, vmid);
+        cache_.write_line(store.address, store.source, CacheStore::line_offset(store.address),
+                          sizeof(uint32_t), vmid);
+        tag->coherence = mtype == Mtype::CC ? simdojo::CoherenceState::SHARED
+                                            : simdojo::CoherenceState::EXCLUSIVE;
+      }
+      write_count_.fetch_add(stores.size(), std::memory_order_relaxed);
+    }
+    return true;
+  });
 }
 
 VmAccessOutcome L2Cache::write(uint64_t addr, const uint8_t *src, uint32_t size, Mtype mtype,

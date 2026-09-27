@@ -10,10 +10,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <vector>
 
 namespace rocjitsu::amdgpu {
 
@@ -96,6 +99,50 @@ inline void write_image_bytes(const GpuVmAccess &memory, uint64_t address,
                               std::span<const uint8_t> bytes) {
   if (memory.write(address, std::as_bytes(bytes)) != VmAccessOutcome::Complete)
     throw std::runtime_error("image write failed");
+}
+
+/// Read the current D32 HTILE words in draw order without per-word VM admission.
+/// The caller excludes observers and debugging. Only private RAM with a stable
+/// strict-transport span is admitted; refusal has no stores or fault callbacks.
+/// A non-expanded word must use the original loop, not a saved clear key: an
+/// earlier pixel store can alias a later metadata word.
+inline bool try_gfx11_expanded_htile(const GpuVmAccess &memory, uint64_t metadata, uint32_t width,
+                                     uint32_t height, uint32_t swizzle) {
+  struct RestoreErrno {
+    int value = errno;
+    ~RestoreErrno() { errno = value; }
+  } restore_errno;
+  // Match the bounded graphics attachment dimensions. This is not a general
+  // image-transfer shortcut; shader materialization retains its own ordering.
+  if (!width || !height || width > 4096 || height > 4096)
+    return false;
+  std::vector<uint64_t> addresses;
+  addresses.reserve(size_t{(width + 7) / 8} * ((height + 7) / 8));
+  uint64_t begin = UINT64_MAX, end = 0;
+  for (uint32_t y = 0; y < height; y += 8) {
+    for (uint32_t x = 0; x < width; x += 8) {
+      const auto address = gfx11_metadata_address(metadata, x, y, width, height, 4, swizzle, true);
+      if (!address || *address > UINT64_MAX - 4)
+        return false;
+      addresses.push_back(*address);
+      begin = std::min(begin, *address);
+      end = std::max(end, *address + 4);
+    }
+  }
+  // All storage, including the lease's prepared request, precedes admission.
+  // The envelope may include unused gaps, but only original logical words are
+  // read. Unknown or fragmented backing declines before any bytes are copied.
+  auto lease = memory.try_lease_ram(begin, end - begin);
+  if (!lease)
+    return false;
+  const auto bytes = lease->bytes();
+  for (uint64_t address : addresses) {
+    uint32_t key;
+    std::memcpy(&key, bytes.data() + (address - begin), sizeof(key));
+    if ((key & 15) != 15)
+      return false;
+  }
+  return true;
 }
 
 /// Materialize one DCC clear block, retaining the uncompressed metadata encoding.

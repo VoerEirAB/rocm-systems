@@ -12,32 +12,39 @@
 #include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace rocjitsu::amdgpu {
 class GpuVmAccess;
+class CpuDispatchPool;
 
 /// Register snapshot and shader outputs for one ordered graphics draw.
 class GraphicsDraw final : public GraphicsStage {
 public:
   GraphicsDraw(const Pm4QueueState &state, rj_code_arch_t arch, uint32_t vertices,
                std::vector<uint32_t> indices = {});
+  /// Select bounded independent primitive groups before the first shader launch.
+  /// Unknown ring identity and ordered shader modes retain one-group scheduling.
+  bool enable_vertex_batching(const GpuVmAccess &memory, uint32_t limit = 32);
   DispatchEntry vertex_dispatch() const;
   void initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave_index) override;
   void export_mask(Wavefront &wave, uint64_t mask) override;
   void export_lane(Wavefront &wave, uint32_t lane, uint32_t target, uint32_t mask,
                    const std::array<uint32_t, 4> &values) override;
   /// Advance only after the preceding shader dispatch has retired and caches are flushed.
-  std::optional<DispatchEntry> advance(const GpuVmAccess &memory);
+  /// RAM read batching requires a caller with no observers or active debugging.
+  std::optional<DispatchEntry> advance(const GpuVmAccess &memory, CpuDispatchPool *pool = nullptr,
+                                       uint32_t threads = 1, bool allow_ram_read_batching = false);
   bool fragment_stage() const { return fragment_stage_; }
   std::shared_ptr<GsRegisters> gs_registers() const override {
     return fragment_stage_ ? nullptr : gs_registers_;
   }
 
 private:
+  friend class GraphicsDrawTestAccess;
   static constexpr uint32_t kColorTargets = 8;
   rj_code_arch_t arch_;
-  uint32_t vertex_count_;
   uint32_t total_vertices_, first_vertex_ = 0;
   uint32_t instance_count_, instance_ = 0;
   uint32_t primitive_type_;
@@ -45,12 +52,22 @@ private:
   std::array<uint32_t, 0x400> sh_;
   std::array<uint32_t, 0x2000> context_;
   uint64_t attribute_ring_base_;
+  uint32_t attribute_ring_bytes_;
+  // A negative only disables an optional path for this draw. It grants no
+  // access, and mapping changes need not turn it back on.
+  bool attribute_ram_candidate_ = false;
   std::shared_ptr<GsRegisters> gs_registers_;
-  std::array<std::array<uint32_t, 4>, 64> positions_{};
-  std::array<uint32_t, 64> position_masks_{};
-  std::array<uint32_t, 64> layer_viewport_{};
-  std::array<uint32_t, 64> primitives_{};
-  std::array<bool, 64> primitive_valid_{};
+  struct VertexGroup {
+    uint32_t count = 0, first_vertex = 0, instance = 0, attribute_offset = 0;
+    std::array<std::array<uint32_t, 4>, 64> positions{};
+    std::array<uint32_t, 64> position_masks{};
+    std::array<uint32_t, 64> layer_viewport{};
+    std::array<uint32_t, 64> primitives{};
+    std::array<bool, 64> primitive_valid{};
+  };
+  std::vector<VertexGroup> vertex_groups_;
+  uint32_t vertex_group_limit_ = 1, attribute_slot_bytes_ = 0;
+  uint32_t next_raster_group_ = 0;
   struct ColorExport {
     uint32_t mask = 0;
     std::array<uint32_t, 4> values{};
@@ -103,13 +120,22 @@ private:
   uint32_t stencil_swizzle_ = 0, stencil_pitch_ = 0;
   uint32_t stencil_tail_x_ = 0, stencil_tail_y_ = 0;
   bool attachments_prepared_ = false;
-  void finish_vertices();
+  void finish_vertices(const VertexGroup &group);
   DispatchEntry fragment_dispatch() const;
   void prepare_colors();
-  void rasterize(const GpuVmAccess &memory);
-  void write_outputs(const GpuVmAccess &memory);
-  uint32_t primitive_count() const;
-  void select_vertex_group();
+  void prepare_attachments();
+  bool try_gather_attributes(const GpuVmAccess &memory, const VertexGroup &group,
+                             const std::array<uint32_t, 3> &indices, uint32_t provoking_index,
+                             std::span<uint32_t> words);
+  bool classify_attribute_ram_reads() const;
+  void rasterize(const GpuVmAccess &memory, const VertexGroup &group, CpuDispatchPool *pool,
+                 uint32_t threads, bool allow_ram_read_batching);
+  void write_outputs(const GpuVmAccess &memory, CpuDispatchPool *pool, uint32_t threads);
+  bool try_parallel_outputs(const GpuVmAccess &memory, CpuDispatchPool &pool, uint32_t threads);
+  template <typename Memory>
+  void write_output_fragment(const Memory &memory, const FragmentWave &batch, uint32_t lane);
+  uint32_t primitive_count(const VertexGroup &group) const;
+  void select_vertex_groups();
   std::optional<DispatchEntry> next_vertex_group();
 };
 

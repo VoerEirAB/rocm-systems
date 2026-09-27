@@ -68,6 +68,13 @@ void Wavefront::debug_write_vgpr(uint32_t reg, uint32_t lane, uint32_t value) {
   cu_.write_vgpr(vgpr_alloc_.base + reg, lane, value);
 }
 
+std::span<uint32_t> Wavefront::initialization_vgpr_lanes(uint32_t reg) {
+  if (reg >= vgpr_alloc_.count || !cu_.owns_vgpr_range(*this, vgpr_alloc_.base + reg, 1))
+    return {};
+  auto *lanes = reinterpret_cast<uint32_t *>(cu_.raw_vgpr_data(vgpr_alloc_.base + reg));
+  return lanes ? std::span<uint32_t>{lanes, wf_size_} : std::span<uint32_t>{};
+}
+
 void ComputeUnitCore::observe_scalar_register_read(const Wavefront &wf, RegisterRef reg) const {
   SuspendedMemoryWaitCheck observer_scope;
   plugin_group_->onAmdgpuReadScalarRegister(&wf, reg);

@@ -2226,6 +2226,13 @@ CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
   if (entry.grid_faulted())
     return {.dispatched = 0, .outcome = VmAccessOutcome::Complete};
 
+  // Graphics WGs rotate across shader engines as well as CUs within each SPI.
+  // Keep the established placement for observers and debugger-controlled waves.
+  const bool rotate_graphics_spis =
+      entry.graphics_stage && !entry.has_workgroup_clusters() && spis_.size() > 1 &&
+      plugin_group_->empty() &&
+      std::ranges::none_of(cus_, [](const auto *cu) { return cu->debug_active(); });
+
   // All waves in one workgroup currently land on one physical CU so the
   // existing barrier implementation remains local. WGP mode additionally
   // reserves that CU's sibling and binds the waves to their shared LDS pool.
@@ -2424,9 +2431,12 @@ CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
     // SPI selects the CU or sibling-CU WGP based on descriptor mode and
     // resource availability.
     std::optional<ShaderProcessorInput::WorkgroupPlacement> placement;
+    size_t selected_spi = 0;
     if (!spis_.empty()) {
-      for (auto *spi : spis_) {
-        placement = spi->allocate_workgroup(entry, global_wg_id);
+      const size_t first_spi = rotate_graphics_spis ? entry.graphics_spi_cursor : 0;
+      for (size_t attempt = 0; attempt < spis_.size(); ++attempt) {
+        selected_spi = rotate_graphics_spis ? (first_spi + attempt) % spis_.size() : attempt;
+        placement = spis_[selected_spi]->allocate_workgroup(entry, global_wg_id);
         if (placement)
           break;
       }
@@ -2457,6 +2467,8 @@ CommandProcessor::dispatch_workgroups(DispatchEntry &entry) {
         dispatch_to_placement(local_wg_id, global_wg_id, *placement);
     if (placement_outcome != VmAccessOutcome::Complete)
       return {.dispatched = dispatched, .outcome = placement_outcome};
+    if (rotate_graphics_spis)
+      entry.graphics_spi_cursor = (selected_spi + 1) % spis_.size();
   }
   return {.dispatched = dispatched, .outcome = VmAccessOutcome::Complete};
 }
@@ -3108,6 +3120,11 @@ void CommandProcessor::draw_pm4(const Pm4SubmitQueue &queue, Pm4DispatchState &q
     throw std::runtime_error("graphics draw requires a compute unit");
   auto draw = std::make_shared<GraphicsDraw>(*queue.pm4, cus_[0]->config().arch, vertices,
                                              std::move(indices));
+  if (plugin_group_->empty() &&
+      std::ranges::none_of(cus_, [](const auto *cu) { return cu->debug_active(); })) {
+    if (auto access = snapshot_gpu_access(queue.address_space))
+      draw->enable_vertex_batching(*access);
+  }
   auto dp = draw->vertex_dispatch();
   queue.pm4->draw = std::move(draw);
   dispatch_graphics_pm4(queue, qs, std::move(dp));
@@ -3208,7 +3225,21 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
     };
     if (state.draw) {
       flush_gpu_caches();
-      if (auto dp = state.draw->advance(*access)) {
+      CpuDispatchPool *raster_pool = nullptr;
+      if (dispatch_threads_ > 1 && plugin_group_->empty()) {
+        if (shared_dispatch_pool_) {
+          raster_pool = shared_dispatch_pool_;
+        } else {
+          if (!local_dispatch_pool_ || local_dispatch_pool_->thread_count() < dispatch_threads_)
+            local_dispatch_pool_ = std::make_unique<CpuDispatchPool>(dispatch_threads_);
+          raster_pool = local_dispatch_pool_.get();
+        }
+      }
+      const bool allow_ram_read_batching =
+          plugin_group_->empty() &&
+          std::ranges::none_of(cus_, [](const auto *cu) { return cu->debug_active(); });
+      if (auto dp = state.draw->advance(*access, raster_pool, dispatch_threads_,
+                                        allow_ram_read_batching)) {
         dispatch_graphics_pm4(queue, qs, std::move(*dp));
         return;
       }

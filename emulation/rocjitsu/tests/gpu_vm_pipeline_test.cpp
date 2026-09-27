@@ -4,6 +4,8 @@
 #include "cdna5_sim_test_common.h"
 
 #include "rocjitsu/isa/arch/amdgpu/shared/tensor_dma.h"
+#include "rocjitsu/kmd/linux/kfd_process.h"
+#include "rocjitsu/kmd/linux/legacy_gpu_vm.h"
 #include "rocjitsu/vm/amdgpu/gpu_vm.h"
 #include "rocjitsu/vm/amdgpu/memory_pipeline.h"
 #include "rocjitsu/vm/plugins/execution_plugin_group.h"
@@ -478,6 +480,64 @@ TEST(GpuVmPipeline, TranslatedScalarLoadAndStoreUseExternalBacking) {
   EXPECT_EQ(context.sim.memory->read32(kAddress), kLegacyValue);
   EXPECT_EQ(context.external->read_calls, 1u);
   EXPECT_EQ(context.external->write_calls, 1u);
+}
+
+TEST(GpuVmPipeline, ScalarPrivateBatchRequiresUnobservedQuantumAndFullMask) {
+  constexpr uint32_t vmid = 79;
+  constexpr uint64_t address = 0x4000;
+  Gfx1250Sim sim;
+  rocjitsu::KfdProcess process(vmid);
+  std::array<uint32_t, 8> input{1, 2, 3, 4, 5, 6, 7, 8};
+  process.map_pages(address, input.data(), sizeof(input), amdgpu::Mtype::UC,
+                    amdgpu::LegacyHostExtentOwner::DriverSealedRam);
+  amdgpu::LegacyGpuVmAdapter adapter(sim.soc->gpu_vm(), sim.memory);
+  const auto handle = adapter.register_address_space(
+      vmid, {.page_table = &process.page_table_,
+             .page_table_mutex = &process.page_table_mutex_,
+             .page_table_generation = process.page_table_generation(),
+             .request_mutex = process.page_table_request_mutex(),
+             .mutation_epoch = process.page_table_mutation_epoch(),
+             .page_table_cache_state = process.page_table_cache_state()});
+  ASSERT_TRUE(handle);
+  auto *cu = sim.cu();
+  cu->set_gpu_vm(&sim.soc->gpu_vm());
+  auto *wf = cu->dispatch_wf(0, 0, kGfx1250ScalarSlots, 32);
+  ASSERT_NE(wf, nullptr);
+  ASSERT_NE(cu->l2(), nullptr);
+  wf->set_process_id(vmid);
+  wf->set_address_space(handle);
+  auto observed = std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{});
+  ASSERT_TRUE(observed->add(std::make_unique<MemoryLifecyclePlugin>()));
+  amdgpu::ScalarMemPipeline pipeline(&cu->l1_scalar());
+  for (const bool quantum : {false, true}) {
+    std::optional<amdgpu::GpuVmAccessBatchGuard> guard;
+    if (quantum)
+      guard.emplace();
+    for (const bool plugin : {false, true}) {
+      cu->set_plugin_group(plugin ? observed : nullptr);
+      for (const bool debug : {false, true}) {
+        cu->set_debug_active(debug);
+        for (const uint16_t mask : {uint16_t{0xffff}, uint16_t{0xf}}) {
+          auto load = std::make_unique<amdgpu::ScalarMemState>();
+          load->addr = address;
+          load->dst_register = {amdgpu::ScalarRegisterStorage::SGPR, 8, 8};
+          load->num_dwords = 8;
+          load->is_load = true;
+          load->load_dword_mask = mask;
+          const uint64_t before = cu->l2()->backing_read_transactions();
+          ASSERT_EQ(pipeline.issue(new TestMemoryInstruction(std::move(load)), *wf),
+                    amdgpu::VmAccessOutcome::Complete);
+          const uint64_t expected_reads = mask != 0xffff ? 4 : quantum && !plugin && !debug ? 1 : 8;
+          EXPECT_EQ(cu->l2()->backing_read_transactions() - before, expected_reads);
+          for (uint32_t i = 0; i < input.size(); ++i)
+            EXPECT_EQ(cu->read_sgpr_storage(wf->sgpr_alloc().base + 8 + i),
+                      mask & (1u << i) ? input[i] : 0u);
+        }
+      }
+    }
+  }
+  cu->set_debug_active(false);
+  cu->set_plugin_group(nullptr);
 }
 
 TEST(GpuVmPipeline, ScratchWithoutBackingIsATerminalFault) {

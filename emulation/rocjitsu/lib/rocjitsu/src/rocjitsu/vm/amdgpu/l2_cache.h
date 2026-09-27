@@ -141,6 +141,12 @@ public:
   VmAccessOutcome read(uint64_t addr, uint8_t *dst, uint32_t size, Mtype mtype = Mtype::RW,
                        uint32_t vmid = 0);
 
+  /// Batch an unobserved scalar UC request only when this line is absent and
+  /// the direct VM backing proves private, fault-free RAM. False has no guest
+  /// effects; the caller must retain its original per-dword fallback.
+  [[nodiscard]] bool try_read_scalar_ram(uint64_t addr, uint32_t *dst, uint32_t num_dwords,
+                                         uint32_t vmid);
+
   /// @brief Write data to L2 (and possibly through to HBM).
   ///
   /// Used by L1 for write-through (CC) and write-back evictions.
@@ -150,6 +156,12 @@ public:
   /// @param mtype Memory type for caching policy.
   VmAccessOutcome write(uint64_t addr, const uint8_t *src, uint32_t size, Mtype mtype = Mtype::RW,
                         uint32_t vmid = 0);
+
+  /// Optional same-line stores with a live private-RAM proof. Refusal changes
+  /// neither memory nor cache replacement state. Logical counters stay per store.
+  [[nodiscard]] bool try_write_private_dwords(std::span<const VmRamDwordStore> stores,
+                                              Mtype instruction_mtype, Mtype effective_mtype,
+                                              uint32_t vmid);
 
   uint64_t write_count() const { return write_count_.load(std::memory_order_relaxed); }
 
@@ -218,11 +230,12 @@ public:
       }
       if (gpu_vm_ == nullptr)
         return VmAccessOutcome::Unavailable;
-      std::optional<GpuVmAccess> vm_access = gpu_vm_->snapshot_vmid(vmid);
-      if (!vm_access)
-        return VmAccessOutcome::Faulted;
-      return vm_access->atomic_modify(addr, size, [&](std::span<std::byte> target) {
-        fn(reinterpret_cast<uint8_t *>(target.data()), 0);
+      return gpu_vm_->with_vmid_snapshot(vmid, [&](const GpuVmAccess *vm_access) {
+        if (!vm_access)
+          return VmAccessOutcome::Faulted;
+        return vm_access->atomic_modify(addr, size, [&](std::span<std::byte> target) {
+          fn(reinterpret_cast<uint8_t *>(target.data()), 0);
+        });
       });
     } else {
       assert((size == sizeof(uint32_t) || size == sizeof(uint64_t)) &&
@@ -383,7 +396,8 @@ private:
   std::map<std::pair<uint32_t, uint64_t>, DirtyMask> dirty_bytes_;
   std::atomic<bool> has_dirty_lines_{false};
   std::vector<simdojo::Port *> cpl_ports_;
-  std::atomic<uint64_t> write_count_ = 0; ///< Debug: total L2 writes (for trace).
+  // Keep transfer counters off the read-mostly dirty-state cache line.
+  alignas(64) std::atomic<uint64_t> write_count_ = 0; ///< Debug: total L2 writes (for trace).
   // Relaxed atomics: independent cache operations can update these counters
   // concurrently; the values are diagnostic only.
   std::atomic<uint64_t> backing_read_transactions_{0};

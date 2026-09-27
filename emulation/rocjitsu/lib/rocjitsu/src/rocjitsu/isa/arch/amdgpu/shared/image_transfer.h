@@ -102,6 +102,17 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
             : image_mip_layout(gfx12, swizzle, bytes, width, height, max_level + 1, first_level);
   if (!mip)
     return unsupported();
+  // Every lane and filter tap shares the descriptor's mip layouts. Compute
+  // only the levels selected by this instruction, once per level.
+  std::array<std::optional<ImageMipLayout>, 32> mip_layouts{};
+  mip_layouts[first_level] = mip;
+  const auto sample_mip_layout = [&](uint32_t level) -> const std::optional<ImageMipLayout> & {
+    auto &layout = mip_layouts[level];
+    if (!layout)
+      layout = image_mip_layout(gfx12, swizzle, bytes, resource_width, resource_height,
+                                max_level + 1, level);
+    return layout;
+  };
   width = mip->width;
   height = mip->height;
   bool normalized = true, seamless_cube = false;
@@ -451,8 +462,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         }
         return static_cast<uint32_t>(value);
       };
-      const auto lane_mip = image_mip_layout(gfx12, swizzle, bytes, resource_width, resource_height,
-                                             max_level + 1, level);
+      const auto &lane_mip = sample_mip_layout(level);
       if (!lane_mip)
         return unsupported();
       const uint64_t resource_base = base - mip->offset;
@@ -473,31 +483,37 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         if (access.tap_count > ImageSampleAccess::kMaxTaps)
           return unsupported();
         access.taps.resize(access.tap_count);
+        double sample_u = 0, sample_v = 0, x0 = 0, y0 = 0;
         for (uint32_t tap = 0; tap < filter_count * access.taps_per_filter; ++tap) {
           const uint32_t filter_index = tap / access.taps_per_filter;
           const uint32_t filter_tap = tap % access.taps_per_filter;
           const uint32_t source = filter_tap % access.texels_per_tap;
           const uint32_t texel = filter_tap / access.texels_per_tap;
           const uint32_t mip_index = texel / 4;
-          const auto selected =
-              image_mip_layout(gfx12, swizzle, bytes, resource_width, resource_height,
-                               max_level + 1, std::min(level + mip_index, last_level));
+          const auto &selected = sample_mip_layout(std::min(level + mip_index, last_level));
           if (!selected)
             return unsupported();
-          const double offset = double(filter_index) - 0.5 * (filter_count - 1);
-          const double sample_u = image_sample_coordinate(u, offset * sample_step_u);
-          const double sample_v = image_sample_coordinate(v, offset * sample_step_v);
-          double px = sample_u * (normalized ? selected->width : 1) - (linear ? 0.5 : 0);
-          double py = sample_v * (normalized ? selected->height : 1) - (linear ? 0.5 : 0);
-          // Clamp to texel centers before generating weights. This preserves
-          // exact edge texels, including signed zero in a 1x1 mip level.
-          if (linear && !seamless_cube && (wrap_x == 2 || wrap_x == 3))
-            px = std::clamp(px, 0.0, double(selected->width - 1));
-          if (linear && !seamless_cube && (wrap_y == 2 || wrap_y == 3))
-            py = std::clamp(py, 0.0, double(selected->height - 1));
-          const double x0 = std::floor(px), y0 = std::floor(py);
-          access.filters[filter_index].fractions[lane][mip_index] =
-              linear ? std::array{fraction(px - x0), fraction(py - y0)} : std::array{0.0f, 0.0f};
+          // All taps in a footprint share its center. Each mip also shares
+          // the clamped texel origin and weights, including cube helper texels.
+          if (filter_tap == 0) {
+            const double offset = double(filter_index) - 0.5 * (filter_count - 1);
+            sample_u = image_sample_coordinate(u, offset * sample_step_u);
+            sample_v = image_sample_coordinate(v, offset * sample_step_v);
+          }
+          if (texel % 4 == 0 && source == 0) {
+            double px = sample_u * (normalized ? selected->width : 1) - (linear ? 0.5 : 0);
+            double py = sample_v * (normalized ? selected->height : 1) - (linear ? 0.5 : 0);
+            // Clamp to texel centers before generating weights. This preserves
+            // exact edge texels, including signed zero in a 1x1 mip level.
+            if (linear && !seamless_cube && (wrap_x == 2 || wrap_x == 3))
+              px = std::clamp(px, 0.0, double(selected->width - 1));
+            if (linear && !seamless_cube && (wrap_y == 2 || wrap_y == 3))
+              py = std::clamp(py, 0.0, double(selected->height - 1));
+            x0 = std::floor(px);
+            y0 = std::floor(py);
+            access.filters[filter_index].fractions[lane][mip_index] =
+                linear ? std::array{fraction(px - x0), fraction(py - y0)} : std::array{0.0f, 0.0f};
+          }
           const double raw_x = x0 + (linear ? texel & 1 : 0);
           const double raw_y = y0 + (linear ? (texel >> 1) & 1 : 0);
           std::optional<uint32_t> tx, ty;

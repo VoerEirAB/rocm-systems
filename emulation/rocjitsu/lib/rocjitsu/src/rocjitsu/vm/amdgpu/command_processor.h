@@ -526,6 +526,7 @@ public:
 
 private:
   friend class CommandProcessorCloseTestAccess;
+  friend class CommandProcessorPlacementTestAccess;
 
   class QueueRegistrationTransaction {
   public:

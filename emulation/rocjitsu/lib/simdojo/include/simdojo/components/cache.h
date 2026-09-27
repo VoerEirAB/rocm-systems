@@ -165,6 +165,18 @@ public:
     return false;
   }
 
+  /// Inspect residency without changing replacement order or cache contents.
+  const CacheTag *peek(uint64_t addr, uint32_t vmid = 0) const {
+    const uint32_t set = set_index(addr);
+    const uint64_t tag = tag_bits(addr);
+    for (uint32_t way = 0; way < Associativity; ++way) {
+      const auto &entry = tag_at(set, way);
+      if (entry.valid && entry.tag == tag && entry.vmid == vmid)
+        return &entry;
+    }
+    return nullptr;
+  }
+
   /// @brief Allocate a cache line for an address, evicting the LRU victim if needed.
   ///
   /// @param addr The memory address to allocate for.

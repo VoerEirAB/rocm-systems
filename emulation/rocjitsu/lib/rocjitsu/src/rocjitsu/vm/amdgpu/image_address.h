@@ -12,6 +12,31 @@
 
 namespace rocjitsu::amdgpu {
 
+// A fixed XOR equation, evaluated from three four-bit chunks per coordinate.
+struct ImageAddressEquation {
+  std::array<std::array<std::array<uint32_t, 16>, 3>, 2> chunks{};
+  uint32_t x_bits = 0, y_bits = 0;
+  uint32_t offset(uint32_t x, uint32_t y) const {
+    return chunks[0][0][x & 15] ^ chunks[0][1][(x >> 4) & 15] ^ chunks[0][2][(x >> 8) & 15] ^
+           chunks[1][0][y & 15] ^ chunks[1][1][(y >> 4) & 15] ^ chunks[1][2][(y >> 8) & 15];
+  }
+};
+
+constexpr ImageAddressEquation make_image_equation(const uint32_t *masks, uint32_t bits) {
+  ImageAddressEquation result;
+  for (uint32_t bit = 0; bit < bits; ++bit) {
+    // All current equations select only the low twelve bits of either axis.
+    if (masks[bit] & 0xf000f000u)
+      throw "image equation exceeds coordinate table";
+    for (uint32_t axis = 0; axis < 2; ++axis)
+      for (uint32_t chunk = 0; chunk < 3; ++chunk)
+        for (uint32_t value = 0; value < 16; ++value)
+          result.chunks[axis][chunk][value] |=
+              (std::popcount((value << (chunk * 4)) & (masks[bit] >> (axis * 16))) & 1u) << bit;
+  }
+  return result;
+}
+
 /// Block-size log2 for a validated swizzle mode; zero denotes linear storage.
 inline uint32_t image_block_log2(bool gfx12, uint32_t swizzle) {
   if (!swizzle)
@@ -43,21 +68,35 @@ inline std::optional<uint64_t> gfx12_image_offset(uint32_t x, uint32_t y, uint32
       {{0, 0, 0, 1, -1, 2, 3, -2, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8}},
       {{0, 0, 0, 0, 1, -1, 2, -2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7}},
   }};
-  uint32_t element_log2 = 0;
-  while ((1u << element_log2) < bytes)
-    ++element_log2;
-  const uint32_t block_log2 = image_block_log2(true, swizzle);
-  uint32_t x_bits = 0, y_bits = 0, offset = 0;
-  for (uint32_t bit = 0; bit < block_log2; ++bit) {
-    const int selector = patterns[element_log2][bit];
-    if (selector > 0) {
-      x_bits = std::max(x_bits, uint32_t(selector));
-      offset |= ((x >> (selector - 1)) & 1u) << bit;
-    } else if (selector < 0) {
-      y_bits = std::max(y_bits, uint32_t(-selector));
-      offset |= ((y >> (-selector - 1)) & 1u) << bit;
+  static constexpr auto equations = [] {
+    std::array<std::array<ImageAddressEquation, 5>, 4> result{};
+    for (uint32_t mode = 1; mode <= 4; ++mode) {
+      const uint32_t bits = mode == 4 ? 18 : 4 * mode + 4;
+      for (uint32_t element = 0; element < 5; ++element) {
+        uint32_t masks[18]{};
+        uint32_t xb = 0, yb = 0;
+        for (uint32_t bit = 0; bit < bits; ++bit) {
+          const int selector = patterns[element][bit];
+          if (selector > 0) {
+            masks[bit] = 1u << (selector - 1);
+            xb = std::max(xb, uint32_t(selector));
+          } else if (selector < 0) {
+            masks[bit] = 1u << (16 - selector - 1);
+            yb = std::max(yb, uint32_t(-selector));
+          }
+        }
+        auto &equation = result[mode - 1][element];
+        equation = make_image_equation(masks, bits);
+        equation.x_bits = xb;
+        equation.y_bits = yb;
+      }
     }
-  }
+    return result;
+  }();
+  const auto &equation = equations[swizzle - 1][std::countr_zero(bytes)];
+  const uint32_t block_log2 = image_block_log2(true, swizzle);
+  const uint32_t x_bits = equation.x_bits, y_bits = equation.y_bits;
+  const uint32_t offset = equation.offset(x, y);
   const uint32_t pitch_blocks = (width + (1u << x_bits) - 1) >> x_bits;
   const uint64_t block = uint64_t{y >> y_bits} * pitch_blocks + (x >> x_bits);
   return (block << block_log2) + offset;
@@ -176,13 +215,17 @@ inline std::optional<uint64_t> gfx11_image_offset(uint32_t x, uint32_t y, uint32
            0x00040000, 0x00080080, 0x00800008, 0x00800040},
       },
   };
+  static constexpr auto equations = [] {
+    std::array<std::array<ImageAddressEquation, 5>, 4> result{};
+    for (uint32_t pattern = 0; pattern < 4; ++pattern)
+      for (uint32_t element = 0; element < 5; ++element)
+        result[pattern][element] =
+            make_image_equation(masks[pattern][element], (pattern & 1) ? 18 : 16);
+    return result;
+  }();
   const uint32_t element_log2 = std::countr_zero(bytes);
   const uint32_t pattern = (render ? 2 : 0) + (block_log2 == 18);
-  uint32_t offset = 0;
-  for (uint32_t bit = 0; bit < block_log2; ++bit) {
-    const uint32_t mask = masks[pattern][element_log2][bit];
-    offset |= ((std::popcount(x & (mask & 0xffff)) + std::popcount(y & (mask >> 16))) & 1u) << bit;
-  }
+  const uint32_t offset = equations[pattern][element_log2].offset(x, y);
   const uint32_t x_bits = (block_log2 - element_log2 + 1) / 2;
   const uint32_t y_bits = (block_log2 - element_log2) / 2;
   const uint32_t pitch_blocks = (width + (1u << x_bits) - 1) >> x_bits;

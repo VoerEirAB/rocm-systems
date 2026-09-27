@@ -4,6 +4,7 @@
 #include "rocjitsu/vm/amdgpu/buffer_format.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/addr_calc_buffer.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/fp_mode.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/unorm.h"
 #include "rocjitsu/vm/amdgpu/compute_unit.h"
 #include "rocjitsu/vm/amdgpu/image_filter.h"
 #include "rocjitsu/vm/amdgpu/lds.h"
@@ -249,6 +250,8 @@ uint32_t unpack(uint32_t value, uint32_t width, Number n) {
 uint32_t pack(uint32_t value, uint32_t width, Number n) {
   if (integer(n) || (n == Number::Float && width == 32))
     return value & mask(width);
+  if (n == Number::Unorm && hwfloat::supports_unorm_width(width))
+    return hwfloat::unorm_from_f32(value, width);
   const float input = std::bit_cast<float>(value);
   if (n == Number::Float) {
     if (width == 16)
@@ -356,6 +359,15 @@ util::Result pack_buffer_format(uint32_t format, uint32_t selectors,
   const auto decoded = decode(format, encoding);
   if (decoded.failed())
     return util::Result::failure();
+  // Every channel of this path uses integer bits, including NaN classification.
+  // Other formats and the shader-store conversion scope retain their FP policy.
+  if (decoded.value().number == Number::Unorm &&
+      std::ranges::all_of(decoded.value().widths, [](uint32_t width) {
+        return width == 0 || hwfloat::supports_unorm_width(width);
+      })) {
+    pack_format(decoded.value(), selectors, components, bytes);
+    return util::Result::success();
+  }
   const fp_mode::detail::ScopedFenv environment(0);
   pack_format(decoded.value(), selectors, components, bytes);
   return util::Result::success();
@@ -432,6 +444,15 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
     return;
   const auto &format = d.decoded_buffer_format;
   const fp_mode::detail::ScopedFenv environment(0);
+  // Fixed UNORM8 filtering consumes integer texel units. Decode those units
+  // directly instead of normalizing to FP32 and rounding back for each tap.
+  const bool unorm8_texels =
+      d.image_sample && d.image_sample->tap_count >= 4 && !d.image_srgb &&
+      format.number == Number::Unorm && format.widths[0] == 8 &&
+      std::ranges::all_of(format.widths, [](uint32_t width) { return width == 0 || width == 8; });
+  std::array<uint32_t, 4> channel_offsets{};
+  for (uint32_t c = 1; c < channel_offsets.size(); ++c)
+    channel_offsets[c] = channel_offsets[c - 1] + format.widths[c - 1] / 8;
   for (uint32_t lane = 0; lane < d.wf_size; ++lane) {
     if (!(d.exec_mask & (1ULL << lane)))
       continue;
@@ -443,7 +464,24 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
                              ? std::span(d.response_data)
                                    .subspan((tap * d.wf_size + lane) * d.elem_size, d.elem_size)
                              : std::span<const uint8_t>{};
-      auto values = unpack_format(format, d.buffer_selectors, bytes);
+      std::array<uint32_t, 4> values{};
+      if (unorm8_texels) {
+        for (uint32_t c = 0; c < d.buffer_components; ++c) {
+          const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
+          if (selector == 1) {
+            values[c] = 255;
+          } else if (selector >= 4) {
+            if (border && valid) {
+              const uint32_t color = d.image_sample->border_color;
+              values[c] = color == 2 || (color == 1 && selector == 7) ? 255 : 0;
+            } else if (!bytes.empty() && format.widths[selector - 4]) {
+              values[c] = bytes[channel_offsets[selector - 4]];
+            }
+          }
+        }
+        return values;
+      }
+      values = unpack_format(format, d.buffer_selectors, bytes);
       for (uint32_t i = 0; i < d.buffer_components; ++i) {
         const uint32_t selector = (d.buffer_selectors >> (3 * i)) & 7;
         if (border && valid && selector >= 4) {
@@ -472,9 +510,23 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
     };
     auto values = texel(0);
     if (d.image_sample && d.image_sample->tap_count >= 4) {
-      std::array<std::array<uint32_t, 4>, ImageSampleAccess::kMaxTaps> texels{};
-      for (uint32_t tap = 0; tap < d.image_sample->tap_count; ++tap)
+      const uint32_t filter_count = d.image_sample->filter_counts[lane];
+      const uint32_t tap_count = filter_count * d.image_sample->taps_per_filter;
+      // Initialize only the texels consumed by this lane's filters, reusing
+      // the first texel already decoded above.
+      std::array<std::array<uint32_t, 4>, ImageSampleAccess::kMaxTaps> texels;
+      texels[0] = values;
+      for (uint32_t tap = 1; tap < tap_count; ++tap)
         texels[tap] = texel(tap);
+      std::array<std::array<std::array<double, 4>, 2>, ImageSampleAccess::kMaxFilters> weights;
+      const uint32_t levels =
+          d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap ? 2 : 1;
+      for (uint32_t filter = 0; filter < filter_count; ++filter)
+        for (uint32_t level = 0; level < levels; ++level) {
+          const double x = d.image_sample->filters[filter].fractions[lane][level][0];
+          const double y = d.image_sample->filters[filter].fractions[lane][level][1];
+          weights[filter][level] = {(1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y};
+        }
       for (uint32_t c = 0; c < d.buffer_components; ++c) {
         const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
         const bool fixed_unorm = format.number == Number::Unorm &&
@@ -484,8 +536,6 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
         const uint32_t unorm_max = (1u << unorm_width) - 1;
         const auto filter_sample = [&](uint32_t filter_index) {
           const auto filter_level = [&](uint32_t level) {
-            const double x = d.image_sample->filters[filter_index].fractions[lane][level][0];
-            const double y = d.image_sample->filters[filter_index].fractions[lane][level][1];
             std::array<double, 4> channels{};
             const auto &access = *d.image_sample;
             const uint32_t corners = access.filters[filter_index].cube_corners[lane][level];
@@ -493,6 +543,8 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
               const uint32_t first =
                   filter_index * access.taps_per_filter + (level * 4 + tap) * access.texels_per_tap;
               const auto channel = [&](uint32_t source) {
+                if (unorm8_texels)
+                  return double(texels[first + source][c]);
                 const double value = std::bit_cast<float>(texels[first + source][c]);
                 return fixed_unorm ? round_even(value * unorm_max) : value;
               };
@@ -501,23 +553,24 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
                 channels[tap] =
                     (channels[tap] * 21846 + channel(1) * 21845 + channel(2) * 21845) / 65536;
             }
-            const std::array weights{(1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y};
+            const auto &level_weights = weights[filter_index][level];
             if (!fixed_unorm)
               return filter_float_texels(
-                  channels, weights, corners,
+                  channels, level_weights, corners,
                   format.number == Number::Float && format.widths[0] == 32 ? 25 : 12);
-            return channels[0] * weights[0] + channels[1] * weights[1] + channels[2] * weights[2] +
-                   channels[3] * weights[3];
+            return channels[0] * level_weights[0] + channels[1] * level_weights[1] +
+                   channels[2] * level_weights[2] + channels[3] * level_weights[3];
           };
           double filtered = filter_level(0);
           if (d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap) {
             const double fraction = d.image_sample->mip_fractions[lane];
             if (fixed_unorm) {
               // Each weighted mip retains nineteen fractional texel-value bits
-              // before the two contributions are added.
-              filtered = (round_even(std::ldexp(filtered * (1 - fraction), 19)) +
-                          round_even(std::ldexp(filter_level(1) * fraction, 19))) /
-                         std::ldexp(1.0, 19);
+              // before the two contributions are added. Fixed texel values
+              // and Q8 fractions keep these binary scales exact and normal.
+              filtered = (round_even(filtered * (1 - fraction) * 0x1p19) +
+                          round_even(filter_level(1) * fraction * 0x1p19)) *
+                         0x1p-19;
             } else {
               // Do not multiply an unused mip's NaN/infinity by zero, or lose
               // signed zero at an exact mip level.
@@ -531,7 +584,6 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
           }
           return filtered;
         };
-        const uint32_t filter_count = d.image_sample->filter_counts[lane];
         double filtered;
         int accumulation_exponent = 0;
         if (filter_count > 1) {
@@ -540,8 +592,7 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
                 filter_sample(index) * image_anisotropic_filter_weight(filter_count, index);
             // The UNORM accumulator normalizes after summation. Each weighted
             // contribution retains nineteen fractional texel-value bits.
-            return fixed_unorm ? round_even(std::ldexp(value * std::bit_floor(filter_count), 19)) /
-                                     std::ldexp(1.0, 19)
+            return fixed_unorm ? round_even(value * std::bit_floor(filter_count) * 0x1p19) * 0x1p-19
                                : value;
           };
           filtered = weighted_filter(0);
@@ -562,9 +613,9 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
           // Anisotropic accumulation rounds half up before normalization, then
           // discards the normalization remainder. A single filter rounds even.
           const uint64_t rounded_unorm =
-              filter_count > 1 ? static_cast<uint64_t>(std::floor(std::ldexp(filtered, 13) + 0.5)) /
+              filter_count > 1 ? static_cast<uint64_t>(std::floor(filtered * 0x1p13 + 0.5)) /
                                      std::bit_floor(filter_count)
-                               : static_cast<uint64_t>(round_even(std::ldexp(filtered, 13)));
+                               : static_cast<uint64_t>(round_even(filtered * 0x1p13));
           // Normalize by repeating eight- or ten-bit fields, then convert
           // the 34 fractional bits to FP32 with midpoints rounded up. Packed
           // two-bit alpha is expanded to ten bits before filtering as well.
@@ -576,7 +627,18 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
           const uint32_t shift = bits > 24 ? bits - 24 : 0;
           if (shift)
             normalized = (normalized + (uint64_t{1} << (shift - 1))) >> shift;
-          filtered = std::ldexp(static_cast<double>(normalized), static_cast<int>(shift) - 34);
+          // The rounded integer has at most 24 significant bits, or an exact
+          // power-of-two carry. Its nonzero scaled result is normal FP32.
+          // Encode that exact value without a general floating scaling call.
+          values[c] = 0;
+          if (normalized) {
+            const uint32_t leading = std::bit_width(normalized) - 1;
+            const uint32_t significand =
+                static_cast<uint32_t>((normalized << (63 - leading)) >> 40);
+            const uint32_t exponent = leading + shift + (127 - 34);
+            values[c] = (exponent << 23) | (significand & 0x7fffffu);
+          }
+          continue;
         } else if (std::isfinite(filtered) && filtered != 0) {
           const int exponent =
               filter_count > 1 ? accumulation_exponent : 1 + std::ilogb(std::abs(filtered));

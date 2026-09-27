@@ -4,11 +4,16 @@
 #include "rocjitsu/isa/arch/amdgpu/generated/rdna3/builders.h"
 #include "rocjitsu/isa/arch/amdgpu/generated/rdna3_5/builders.h"
 #include "rocjitsu/isa/arch/amdgpu/generated/rdna4/builders.h"
+#include "rocjitsu/isa/arch/amdgpu/rdna3/isa.h"
+#include "rocjitsu/isa/arch/amdgpu/shared/addr_calc_buffer.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/graphics_instructions.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/image_transfer.h"
 #include "rocjitsu/isa/decoder.h"
 #include "rocjitsu/isa/instruction.h"
+#include "rocjitsu/kmd/linux/kfd_process.h"
+#include "rocjitsu/kmd/linux/legacy_gpu_vm.h"
 #include "rocjitsu/vm/amdgpu/compute_unit.h"
+#include "rocjitsu/vm/amdgpu/cpu_dispatch_pool.h"
 #include "rocjitsu/vm/amdgpu/gpu_memory.h"
 #include "rocjitsu/vm/amdgpu/gpu_memory_access.h"
 #include "rocjitsu/vm/amdgpu/graphics_draw.h"
@@ -23,14 +28,95 @@
 #include "rocjitsu/vm/amdgpu/memory_pipeline.h"
 #include "rocjitsu/vm/amdgpu/raster_math.h"
 #include "rocjitsu/vm/amdgpu/wavefront.h"
+#include "rocjitsu/vm/plugins/execution_plugin_group.h"
 #include "util/data_types.h"
 #include "util/except.h"
 
+#include <barrier>
+#include <cerrno>
+#include <cfenv>
 #include <cmath>
+#include <cstring>
 
 #include <gtest/gtest.h>
 
 using namespace rocjitsu;
+
+namespace rocjitsu::amdgpu {
+class GraphicsDrawTestAccess {
+public:
+  static std::vector<uint32_t> fragment_bits(const GraphicsDraw &draw) {
+    std::vector<uint32_t> bits{draw.fragment_wave_size_};
+    for (const auto &batch : draw.fragments_) {
+      bits.push_back(batch.relative_layer);
+      bits.push_back(batch.front);
+      bits.push_back(batch.parameters.size());
+      bits.insert(bits.end(), batch.parameters.begin(), batch.parameters.end());
+      for (const auto &fragment : batch.lanes) {
+        bits.push_back(fragment.x);
+        bits.push_back(fragment.y);
+        bits.push_back(fragment.covered);
+        for (float value :
+             {fragment.i, fragment.j, fragment.z, fragment.linear_i, fragment.linear_j,
+              fragment.pull_model[0], fragment.pull_model[1], fragment.pull_model[2]})
+          bits.push_back(std::bit_cast<uint32_t>(value));
+        for (const auto &color : fragment.exports) {
+          bits.push_back(color.mask);
+          bits.insert(bits.end(), color.values.begin(), color.values.end());
+        }
+      }
+    }
+    return bits;
+  }
+
+  static bool parallel_output(GraphicsDraw &draw, const GpuVmAccess &memory,
+                              CpuDispatchPool &pool) {
+    return draw.try_parallel_outputs(memory, pool, 4);
+  }
+
+  static void seed_fragment_inputs(GraphicsDraw &draw, uint32_t wave_size,
+                                   bool zero_first_reciprocal = false) {
+    draw.fragment_stage_ = true;
+    draw.fragment_wave_size_ = wave_size;
+    draw.fragments_.resize(1);
+    auto &batch = draw.fragments_.front();
+    batch = {};
+    batch.relative_layer = 0x1234;
+    batch.parameters = {0x01234567, 0x89abcdef, 0x7f801234};
+    draw.sh_[0xb] = 2u << 1;
+    draw.sh_[0xc] = 0x76543210;
+    draw.sh_[0xd] = 0xfedcba98;
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+      auto &f = batch.lanes[lane];
+      f.x = int32_t(lane) - 3;
+      f.y = 2 - int32_t(lane);
+      f.i = std::bit_cast<float>(0x3f000001u + lane);
+      f.j = std::bit_cast<float>(0x80000000u | lane);
+      f.z = std::bit_cast<float>(0x7fc00000u + lane);
+      f.linear_i = std::bit_cast<float>(1u + lane);
+      f.linear_j = std::bit_cast<float>(0xbf800000u + lane);
+      f.pull_model = {std::bit_cast<float>(0x7f800001u + lane), -0.0f,
+                      zero_first_reciprocal && lane == 0 ? 0.0f : 1.0f};
+      f.covered = (0xa5u >> lane) & 1;
+    }
+  }
+
+  static void set_fragment_inputs(GraphicsDraw &draw, uint32_t mask) {
+    draw.context_[0x198] = mask;
+  }
+
+  static bool gather_attributes(GraphicsDraw &draw, const GpuVmAccess &memory,
+                                const std::array<uint32_t, 3> &indices, uint32_t provoking,
+                                std::span<uint32_t> words, uint32_t group_offset = 0,
+                                std::optional<uint64_t> ring_base = std::nullopt) {
+    auto group = draw.vertex_groups_.front();
+    group.attribute_offset = group_offset;
+    if (ring_base)
+      draw.attribute_ring_base_ = *ring_base;
+    return draw.try_gather_attributes(memory, group, indices, provoking, words);
+  }
+};
+} // namespace rocjitsu::amdgpu
 
 namespace {
 
@@ -48,6 +134,68 @@ public:
   void export_lane(amdgpu::Wavefront &, uint32_t lane, uint32_t target, uint32_t mask,
                    const std::array<uint32_t, 4> &values) override {
     exports.push_back({lane, target, mask, values});
+  }
+};
+
+class GraphicsBatchMemory final : public amdgpu::PhysicalMemoryAccess,
+                                  public amdgpu::AddressSpaceTranslator {
+public:
+  mutable std::vector<std::byte> bytes = std::vector<std::byte>(0x400000);
+  std::optional<std::pair<uint64_t, uint64_t>> alias_page;
+  std::optional<uint64_t> missing_page;
+  bool identity_available = true;
+  uint64_t reads = 0, writes = 0;
+  mutable uint64_t ram_lease_requests = 0;
+
+  std::unique_ptr<amdgpu::VmRamLeaseRequest>
+  prepare_ram_lease(amdgpu::PhysicalMemoryAccess &,
+                    std::span<const amdgpu::VmRamRange>) const override {
+    ++ram_lease_requests;
+    return nullptr;
+  }
+
+  amdgpu::VmTranslationResult translate(uint64_t address, size_t size,
+                                        amdgpu::VmAccessKind access) const override {
+    if (missing_page && (address >> 12) == *missing_page)
+      return {};
+    return amdgpu::IdentityAddressSpaceTranslator{}.translate(address, size, access);
+  }
+
+  std::byte *pointer(uint64_t address, size_t size) const {
+    if (missing_page && (address >> 12) == *missing_page)
+      return nullptr;
+    if (alias_page && (address >> 12) == alias_page->first)
+      address = (alias_page->second << 12) | (address & 4095);
+    return address <= bytes.size() && size <= bytes.size() - address ? bytes.data() + address
+                                                                     : nullptr;
+  }
+  amdgpu::VmAccessOutcome read(amdgpu::VmMemoryDomain, uint64_t address,
+                               std::span<std::byte> destination) override {
+    ++reads;
+    const auto *source = pointer(address, destination.size());
+    if (!source)
+      return amdgpu::VmAccessOutcome::Faulted;
+    std::memcpy(destination.data(), source, destination.size());
+    return amdgpu::VmAccessOutcome::Complete;
+  }
+  amdgpu::VmAccessOutcome write(amdgpu::VmMemoryDomain, uint64_t address,
+                                std::span<const std::byte> source) override {
+    ++writes;
+    auto *destination = pointer(address, source.size());
+    if (!destination)
+      return amdgpu::VmAccessOutcome::Faulted;
+    std::memcpy(destination, source.data(), source.size());
+    return amdgpu::VmAccessOutcome::Complete;
+  }
+  std::byte *resolve_host_pointer(amdgpu::VmMemoryDomain, uint64_t address,
+                                  size_t size) const override {
+    return identity_available ? pointer(address, size) : nullptr;
+  }
+  std::pair<uint64_t, uint64_t> host_range(amdgpu::VmMemoryDomain,
+                                           uint64_t address) const override {
+    const auto *host = identity_available ? pointer(address & ~uint64_t{65535}, 65536) : nullptr;
+    return host ? std::pair{reinterpret_cast<uint64_t>(host), uint64_t{65536}}
+                : std::pair<uint64_t, uint64_t>{};
   }
 };
 
@@ -139,6 +287,38 @@ protected:
     ctx[gfx12 ? 0x205 : 0x206] = 0x43f;
     ctx[0x30e] = ctx[0x30f] = 0xffffffffu;
     return state;
+  }
+
+  amdgpu::Pm4QueueState batch_state(uint32_t wave_size = 32) const {
+    auto state = rectangle_state();
+    const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+    auto &ctx = state.context_registers;
+    state.uconfig_registers[0x446] = 1; // 64 KiB ring at 0x10000.
+    state.sh_registers[gfx12 ? 0x89 : 0xc8] = 0x2000;
+    state.sh_registers[0x8] = 0x2100;
+    state.sh_registers[0x8b] = (gfx12 ? 1u : 3u) << 16;
+    ctx[gfx12 ? 0x2a6 : 0x2d5] = wave_size == 32 ? 1u << 22 : 0;
+    ctx[gfx12 ? 0x190 : 0x1b6] = 1u << 15; // Wave32 fragment shader.
+    ctx[gfx12 ? 0x31e : 0x3b0] = gfx12 ? 3 | (3 << 16) : 3 | (3 << 14);
+    ctx[gfx12 ? 0x3b0 : 0x31c] = 10; // Linear RGBA8.
+    ctx[0x318] = 0x1000;
+    ctx[gfx12 ? 0x214 : 0x8e] = ctx[gfx12 ? 0x215 : 0x8f] = 15;
+    ctx[gfx12 ? 0x195 : 0x1c5] = 9; // Full float exports.
+    ctx[gfx12 ? 0x216 : 0x202] = 0xcc0010;
+    ctx[gfx12 ? 0x198 : 0x1b4] = 0x302;  // Perspective center and position X/Y.
+    ctx[gfx12 ? 0x1b : 0x203] = 1u << 4; // EARLY_Z_THEN_LATE_Z.
+    ctx[0x10f] = ctx[0x110] = ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(2.0f);
+    ctx[0x91] = (4 - gfx12) | ((4 - gfx12) << 16);
+    return state;
+  }
+
+  void batch_wave(uint32_t size, uint32_t group) {
+    if (wave_->wf_size() != size) {
+      wave_->halt();
+      wave_ = cu_->dispatch_wf(0, 0, 106, 16, size);
+    }
+    wave_->set_lds(&lds_);
+    wave_->set_wg_coord(group, 0, 0);
   }
 
   void export_rectangle_vertices(amdgpu::GraphicsDraw &draw) {
@@ -384,6 +564,676 @@ TEST_P(GraphicsExportTest, HalfInterpolationResultsHonorRoundingMode) {
       EXPECT_EQ(cu_->read_vgpr(wave_->vgpr_alloc().base + 6, 31), 0x12345678u);
     }
   }
+}
+
+TEST_P(GraphicsExportTest, ParallelColorTilesPreserveOverlapAndHostEnvironment) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  constexpr uint32_t width = 128, height = 64;
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  amdgpu::LegacyPageTable table;
+  util::DistributedSharedMutex table_mutex;
+  auto request_mutex = std::make_shared<util::DistributedSharedMutex>();
+  std::vector<uint8_t> storage(65536);
+  for (size_t page = 0; page < storage.size() / 4096; ++page)
+    table[0x100 + page] = {storage.data() + page * 4096, amdgpu::Mtype::RW,
+                           amdgpu::LegacyHostExtentOwner::DriverSealedRam};
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+  const auto handle =
+      adapter.register_address_space(7, &table, &table_mutex, nullptr, request_mutex);
+  auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  amdgpu::CpuDispatchPool pool(4);
+  std::fenv_t saved_environment;
+  std::fegetenv(&saved_environment);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &environment;
+    int error;
+    ~Restore() {
+      std::fesetenv(&environment);
+      errno = error;
+    }
+  } restore{saved_environment, saved_errno};
+  for (uint32_t blend : {0u, (1u << 30) | 1u | (1u << 8)}) {
+    for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      SCOPED_TRACE(blend);
+      SCOPED_TRACE(rounding);
+      auto state = rectangle_state();
+      auto &ctx = state.context_registers;
+      ctx[0x318] = 0x1000;
+      ctx[gfx12 ? 0x3b0 : 0x31c] = 10;
+      ctx[gfx12 ? 0x31e : 0x3b0] =
+          gfx12 ? ((width - 1) << 16) | (height - 1) : ((width - 1) << 14) | (height - 1);
+      ctx[gfx12 ? 0x31f : 0x3b8] = gfx12 ? 3 << 15 : 26 << 14;
+      ctx[gfx12 ? 0x214 : 0x8e] = ctx[gfx12 ? 0x215 : 0x8f] = 15;
+      ctx[gfx12 ? 0x195 : 0x1c5] = 4;
+      ctx[gfx12 ? 0x216 : 0x202] = 0xcc0010;
+      ctx[0x1e0] = blend;
+      ctx[0x10f] = ctx[0x110] = std::bit_cast<uint32_t>(float(width / 2));
+      ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(float(height / 2));
+      ctx[0x91] = (width - gfx12) | ((height - gfx12) << 16);
+      auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 6);
+      for (uint32_t primitive = 0; primitive < 2; ++primitive) {
+        for (uint32_t vertex = 0; vertex < 3; ++vertex)
+          draw->export_lane(*wave_, primitive * 3 + vertex, 12, 15,
+                            {std::bit_cast<uint32_t>(vertex == 2 ? 1.0f : -1.0f),
+                             std::bit_cast<uint32_t>(vertex == 1 ? 1.0f : -1.0f), 0,
+                             std::bit_cast<uint32_t>(1.0f)});
+        const uint32_t index_bits = gfx12 ? 9 : 10;
+        const uint32_t first = primitive * 3;
+        draw->export_lane(
+            *wave_, primitive, 20, 1,
+            {first | ((first + 1) << index_bits) | ((first + 2) << (2 * index_bits)), 0, 0, 0});
+      }
+      const auto dispatch = draw->advance(*access);
+      ASSERT_TRUE(dispatch);
+      ASSERT_GE(dispatch->total_wgs, 128u);
+      for (uint32_t workgroup = 0; workgroup < dispatch->total_wgs; ++workgroup) {
+        wave_->set_wg_coord(workgroup, 0, 0);
+        wave_->set_graphics_stage(draw);
+        draw->initialize(*wave_, workgroup, 0);
+        for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
+          draw->export_lane(
+              *wave_, lane, 0, 3,
+              {workgroup < dispatch->total_wgs / 2 ? 0x34003000u : 0x38003400u, 0x3c003400u, 0, 0});
+      }
+      std::fill(storage.begin(), storage.end(), 0);
+      const auto initial = storage;
+      if (!blend && rounding == FE_TONEAREST) {
+        // A physically contiguous split inside a later pixel is still a strict
+        // transfer boundary. Optional tiling must leave the serial prefix intact.
+        const uint64_t split_page = 0x102;
+        const auto original_entry = table.at(split_page);
+        auto *host = original_entry.host_extents.front().host_ptr;
+        constexpr auto owner = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+        table.at(split_page).host_extents = {{host, 6, 0, owner}, {host + 6, 4090, 6, owner}};
+        auto serial_fault = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+        EXPECT_THROW(serial_fault->advance(*access), std::runtime_error);
+        const auto prefix = storage;
+        EXPECT_NE(prefix, initial);
+        std::copy(initial.begin(), initial.end(), storage.begin());
+        auto tiled_fault = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+        EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*tiled_fault, *access, pool));
+        EXPECT_EQ(storage, initial);
+        EXPECT_THROW(tiled_fault->advance(*access, &pool, 4), std::runtime_error);
+        EXPECT_EQ(storage, prefix);
+        table.at(split_page) = original_entry;
+        std::copy(initial.begin(), initial.end(), storage.begin());
+        auto invalid = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+        wave_->set_wg_coord(dispatch->total_wgs - 1, 0, 0);
+        invalid->export_lane(*wave_, 0, 0, 4, {});
+        EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*invalid, *access, pool));
+        EXPECT_EQ(storage, initial);
+        EXPECT_THROW(invalid->advance(*access), std::runtime_error);
+        EXPECT_NE(storage, initial);
+        std::copy(initial.begin(), initial.end(), storage.begin());
+        std::fenv_t masked;
+        std::fegetenv(&masked);
+        std::feclearexcept(FE_INVALID);
+        feenableexcept(FE_INVALID);
+        EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+        std::fesetenv(&masked);
+      }
+      std::fesetround(rounding);
+      std::feclearexcept(FE_ALL_EXCEPT);
+      std::feraiseexcept(FE_DIVBYZERO);
+      std::fenv_t before;
+      std::fegetenv(&before);
+      before.__mxcsr |= 2; // Preserve the denormal-operand flag as well.
+      std::fesetenv(&before);
+      errno = E2BIG;
+      ASSERT_TRUE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+      std::fenv_t parallel_environment;
+      std::fegetenv(&parallel_environment);
+      const int parallel_errno = errno;
+      const auto parallel = storage;
+      std::copy(initial.begin(), initial.end(), storage.begin());
+      std::fesetenv(&before);
+      errno = E2BIG;
+      EXPECT_FALSE(draw->advance(*access));
+      std::fenv_t serial_environment;
+      std::fegetenv(&serial_environment);
+      EXPECT_EQ(errno, parallel_errno);
+      EXPECT_EQ(serial_environment.__control_word, parallel_environment.__control_word);
+      EXPECT_EQ(serial_environment.__status_word & 0x3f, parallel_environment.__status_word & 0x3f);
+      EXPECT_EQ(serial_environment.__mxcsr, parallel_environment.__mxcsr);
+      EXPECT_EQ(storage, parallel);
+      EXPECT_NE(storage, initial);
+    }
+  }
+#endif
+}
+
+TEST_P(GraphicsExportTest, ParallelDepthAndColorTilesPreserveComparisonsOverlapAndHostEnvironment) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  constexpr uint32_t width = 129, height = 65;
+  constexpr uint64_t base = 0x100000;
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  amdgpu::LegacyPageTable table;
+  util::DistributedSharedMutex table_mutex;
+  auto request_mutex = std::make_shared<util::DistributedSharedMutex>();
+  // Two mipmapped surfaces include their full nonzero array-slice strides.
+  std::vector<uint8_t> storage(2 << 20);
+  for (size_t page = 0; page < storage.size() / 4096; ++page)
+    table[(base >> 12) + page] = {storage.data() + page * 4096, amdgpu::Mtype::RW,
+                                  amdgpu::LegacyHostExtentOwner::DriverSealedRam};
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+  const auto handle =
+      adapter.register_address_space(7, &table, &table_mutex, nullptr, request_mutex);
+  auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  amdgpu::CpuDispatchPool pool(4);
+  std::fenv_t saved_environment;
+  std::fegetenv(&saved_environment);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &environment;
+    int error;
+    ~Restore() {
+      std::fesetenv(&environment);
+      errno = error;
+    }
+  } restore{saved_environment, saved_errno};
+
+  const auto prepare = [&](const amdgpu::Pm4QueueState &state, bool color_exports = true) {
+    auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 9);
+    // Three complete overlapping rectangles. Every pixel must observe primitive
+    // order even when other tiles complete on different workers.
+    for (uint32_t primitive = 0; primitive < 3; ++primitive) {
+      for (uint32_t vertex = 0; vertex < 3; ++vertex)
+        draw->export_lane(*wave_, primitive * 3 + vertex, 12, 15,
+                          {std::bit_cast<uint32_t>(vertex == 2 ? 1.0f : -1.0f),
+                           std::bit_cast<uint32_t>(vertex == 1 ? 1.0f : -1.0f), 0,
+                           std::bit_cast<uint32_t>(1.0f)});
+      const uint32_t shift = gfx12 ? 9 : 10, first = primitive * 3;
+      draw->export_lane(*wave_, primitive, 20, 1,
+                        {first | ((first + 1) << shift) | ((first + 2) << (2 * shift)), 0, 0, 0});
+    }
+    const auto dispatch = draw->advance(*access);
+    EXPECT_TRUE(dispatch);
+    if (!dispatch)
+      return std::shared_ptr<amdgpu::GraphicsDraw>{};
+    EXPECT_GE(dispatch->total_wgs, 128u);
+    // At pixel (0,0), the successive depths are 0.75, 0.25, 0.5. Other lanes
+    // exercise signed zero, subnormals, infinities, NaNs and UNORM rounding edges.
+    constexpr std::array<uint32_t, 16> depths{0x3f400000, 0x80000000, 0,          1,
+                                              0x007fffff, 0x3effffff, 0x3f000001, 0x3f800000,
+                                              0x3f800001, 0xbf800000, 0x7f800000, 0xff800000,
+                                              0x7fc01234, 0x7f801234, 0x3f000000, 0x3eaaaaab};
+    constexpr uint32_t first_depth[] = {0x3f400000, 0x3e800000, 0x3f000000};
+    for (uint32_t workgroup = 0; workgroup < dispatch->total_wgs; ++workgroup) {
+      wave_->set_wg_coord(workgroup, 0, 0);
+      const uint32_t primitive = workgroup / (dispatch->total_wgs / 3);
+      for (uint32_t lane = 0; lane < dispatch->kernel_wave_size; ++lane) {
+        draw->export_lane(*wave_, lane, 8, 1,
+                          {lane % depths.size() == 0 ? first_depth[primitive]
+                                                     : depths[(lane + primitive) % depths.size()],
+                           0, 0, 0});
+        // Missing color must not suppress the middle primitive's depth write.
+        if (color_exports && state.context_registers[gfx12 ? 0x214 : 0x8e] &&
+            !(primitive == 1 && lane % 8 == 0)) {
+          constexpr uint32_t rg[] = {0x30003a00, 0x3a003400, 0x34003800};
+          draw->export_lane(*wave_, lane, 0, 3, {rg[primitive], 0x38003400, 0, 0});
+        }
+      }
+    }
+    return draw;
+  };
+
+  for (uint32_t attachment : {0u, 1u, 2u}) {
+    const uint32_t bytes = attachment == 0 ? 2 : 4;
+    const bool color = attachment == 2;
+    // Linear pitch padding, a tiled surface, and a nonzero mip in one array
+    // slice exercise the address preflight independently of the pixel math.
+    for (uint32_t layout = 0; layout < 3; ++layout) {
+      const uint32_t swizzle = layout == 0 ? 0 : gfx12 ? 3 : layout == 1 ? 24 : 28;
+      const uint32_t level = layout == 2, first_layer = layout == 2;
+      const auto mip = amdgpu::image_mip_layout(gfx12, swizzle, bytes, width << level,
+                                                height << level, level + 1, level);
+      ASSERT_TRUE(mip);
+      const uint64_t layer_base = amdgpu::image_layer_base(
+          gfx12, base + mip->offset, mip->slice_size, first_layer, bytes, swizzle);
+      const auto first_address =
+          gfx12 ? amdgpu::gfx12_image_address(layer_base, mip->tail_x, mip->tail_y, mip->pitch,
+                                              bytes, swizzle)
+                : amdgpu::gfx11_image_address(layer_base, mip->tail_x, mip->tail_y, mip->pitch,
+                                              bytes, swizzle);
+      ASSERT_TRUE(first_address);
+      ASSERT_LE(*first_address + bytes, base + storage.size());
+      for (uint32_t comparison = 0; comparison < 8; ++comparison) {
+        for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+          SCOPED_TRACE(testing::Message()
+                       << attachment << ',' << layout << ',' << comparison << ',' << rounding);
+          std::fesetenv(FE_DFL_ENV);
+          auto state = rectangle_state();
+          auto &ctx = state.context_registers;
+          ctx[gfx12 ? 5 : 7] = ((width << level) - 1) | (((height << level) - 1) << 16);
+          ctx[gfx12 ? 6 : 0x10] =
+              (bytes == 2 ? 1 : 3) | (swizzle << 4) | (level << (gfx12 ? 15 : 16));
+          if (gfx12) {
+            ctx[1] = first_layer | (first_layer << 16);
+            ctx[2] = level << 26;
+            ctx[8] = ctx[10] = base >> 8;
+          } else {
+            ctx[2] = first_layer | (first_layer << 13) | (level << 26);
+            ctx[0x12] = ctx[0x14] = base >> 8;
+          }
+          ctx[gfx12 ? 0x1c : 0x200] = 6 | (comparison << 4);
+          ctx[gfx12 ? 0x19 : 3] = rounding == FE_TOWARDZERO ? (gfx12 ? 1u : 1u << 16) : 0;
+          ctx[gfx12 ? 0x115 : 0xb4] = std::bit_cast<uint32_t>(0.125f);
+          ctx[gfx12 ? 0x116 : 0xb5] = std::bit_cast<uint32_t>(0.875f);
+          ctx[0x10f] = ctx[0x110] = std::bit_cast<uint32_t>(float(width) / 2);
+          ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(float(height) / 2);
+          ctx[0x91] = (width - gfx12) | ((height - gfx12) << 16);
+          if (color) {
+            // A separate R8 or RGBA8 surface has its own pitch and mip layout.
+            ctx[0x318] = 0x1800;
+            ctx[gfx12 ? 0x3b0 : 0x31c] = layout == 1 ? 1 : 10;
+            ctx[gfx12 ? 0x319 : 0x31b] =
+                first_layer | (first_layer << (gfx12 ? 14 : 13)) | (gfx12 ? 0 : level << 26);
+            if (gfx12)
+              ctx[0x31a] = level;
+            ctx[gfx12 ? 0x31e : 0x3b0] =
+                gfx12 ? (((width << level) - 1) << 16) | ((height << level) - 1)
+                      : (((width << level) - 1) << 14) | ((height << level) - 1) | (level << 28);
+            ctx[gfx12 ? 0x31f : 0x3b8] =
+                first_layer | (swizzle << (gfx12 ? 15 : 14)) | (gfx12 ? level << 19 : 0);
+            ctx[gfx12 ? 0x214 : 0x8e] = layout == 1 ? 1 : layout == 2 ? 5 : 15;
+            ctx[gfx12 ? 0x215 : 0x8f] = layout == 1 ? 1 : 15;
+            ctx[gfx12 ? 0x195 : 0x1c5] = 4;
+            ctx[gfx12 ? 0x216 : 0x202] = rounding == FE_TOWARDZERO ? 0x660010 : 0xcc0010;
+            ctx[0x1e0] =
+                rounding == FE_DOWNWARD || rounding == FE_UPWARD ? (1u << 30) | 4u | (5u << 8) : 0;
+          }
+          auto draw = prepare(state);
+          ASSERT_TRUE(draw);
+          const uint32_t initial_bits = bytes == 2 ? 32768 : 0x3f000000;
+          for (size_t offset = 0; offset < storage.size(); offset += bytes)
+            std::memcpy(storage.data() + offset, &initial_bits, bytes);
+          const auto initial = storage;
+
+          if (!color && bytes == 4 && layout == 0 && comparison == 7 && rounding == FE_TONEAREST) {
+            // Read-only depth still evaluates comparisons, but commits no bytes.
+            auto readonly_state = rectangle_state();
+            readonly_state.context_registers = ctx;
+            readonly_state.context_registers[gfx12 ? 0x1c : 0x200] &= ~4u;
+            auto readonly_draw = prepare(readonly_state);
+            ASSERT_TRUE(readonly_draw);
+            EXPECT_TRUE(
+                amdgpu::GraphicsDrawTestAccess::parallel_output(*readonly_draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            for (uint32_t refusal = 0; refusal < 3; ++refusal) {
+              auto refused_state = rectangle_state();
+              refused_state.context_registers = ctx;
+              auto &refused = refused_state.context_registers;
+              if (refusal == 0) {
+                refused[gfx12 ? 0x1c : 0x200] |= 1; // Active stencil is another surface.
+                refused[gfx12 ? 7 : 0x11] = 1;
+                refused[gfx12 ? 0xc : 0x13] = refused[gfx12 ? 0xe : 0x15] = 0x1800;
+              } else if (refusal == 1) {
+                refused[gfx12 ? 1 : 2] |= 1u << (gfx12 ? 16 : 13); // More than one layer.
+              } else {
+                // D16 plus color retains the serial conversion and its host flags.
+                refused[gfx12 ? 6 : 0x10] = 1;
+                refused[0x318] = 0x1800;
+                refused[gfx12 ? 0x3b0 : 0x31c] = 10;
+                refused[gfx12 ? 0x31e : 0x3b0] =
+                    gfx12 ? ((width - 1) << 16) | (height - 1) : ((width - 1) << 14) | (height - 1);
+                refused[gfx12 ? 0x214 : 0x8e] = refused[gfx12 ? 0x215 : 0x8f] = 15;
+                refused[gfx12 ? 0x195 : 0x1c5] = 4;
+                refused[gfx12 ? 0x216 : 0x202] = 0xcc0010;
+              }
+              auto refused_draw = prepare(refused_state);
+              ASSERT_TRUE(refused_draw);
+              EXPECT_FALSE(
+                  amdgpu::GraphicsDrawTestAccess::parallel_output(*refused_draw, *access, pool));
+              EXPECT_EQ(storage, initial);
+            }
+            auto invalid_state = rectangle_state();
+            invalid_state.context_registers = ctx;
+            invalid_state.context_registers[gfx12 ? 6 : 0x10] = 2; // Unsupported depth format.
+            EXPECT_THROW(prepare(invalid_state), std::runtime_error);
+            EXPECT_EQ(storage, initial);
+            // Unknown backing and a later missing/aliased page must decline the
+            // whole operation before any earlier pixel is changed.
+            const uint64_t late_page = (base >> 12) + 2;
+            const auto entry = table.at(late_page);
+            table.at(late_page).host_extents.front().owner = amdgpu::LegacyHostExtentOwner::Driver;
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            table.at(late_page) = entry;
+            table.at(late_page).host_extents.front().host_ptr = storage.data();
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            table.erase(late_page);
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            auto faulting = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+            EXPECT_THROW(faulting->advance(*access), std::runtime_error);
+            EXPECT_NE(storage, initial);
+            table[late_page] = entry;
+            std::copy(initial.begin(), initial.end(), storage.begin());
+            // Whole-span contiguity does not make a split D32 read legal.
+            auto *host = entry.host_extents.front().host_ptr;
+            constexpr auto owner = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+            table.at(late_page).host_extents = {{host, 2, 0, owner}, {host + 2, 4094, 2, owner}};
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            auto split_fault = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+            EXPECT_THROW(split_fault->advance(*access), std::runtime_error);
+            EXPECT_NE(storage, initial);
+            table.at(late_page) = entry;
+            std::copy(initial.begin(), initial.end(), storage.begin());
+            std::fenv_t masked;
+            std::fegetenv(&masked);
+            std::feclearexcept(FE_INVALID);
+            feenableexcept(FE_INVALID);
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            std::fesetenv(&masked);
+            EXPECT_EQ(storage, initial);
+          }
+
+          if (color && layout == 0 && comparison == 7 && rounding == FE_TONEAREST) {
+            // If every color export is absent, only the depth range is leased.
+            auto no_color = prepare(state, false);
+            ASSERT_TRUE(no_color);
+            ASSERT_TRUE(amdgpu::GraphicsDrawTestAccess::parallel_output(*no_color, *access, pool));
+            const auto depth_only = storage;
+            EXPECT_NE(depth_only, initial);
+            EXPECT_TRUE(
+                std::equal(storage.begin() + 0x80000, storage.end(), initial.begin() + 0x80000));
+            std::copy(initial.begin(), initial.end(), storage.begin());
+            EXPECT_FALSE(no_color->advance(*access));
+            EXPECT_EQ(storage, depth_only);
+            std::copy(initial.begin(), initial.end(), storage.begin());
+            auto alias_state = rectangle_state();
+            alias_state.context_registers = ctx;
+            alias_state.context_registers[0x318] = base >> 8;
+            auto alias_draw = prepare(alias_state);
+            ASSERT_TRUE(alias_draw);
+            EXPECT_FALSE(
+                amdgpu::GraphicsDrawTestAccess::parallel_output(*alias_draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            const auto original_table = table;
+            for (uint64_t page = 0; page < 16; ++page)
+              table[0x180 + page] = table.at(0x100 + page);
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            table = original_table;
+            auto mrt_state = rectangle_state();
+            mrt_state.context_registers = ctx;
+            auto &mrt = mrt_state.context_registers;
+            mrt[gfx12 ? 0x321 : 0x327] = 0x1c00;
+            mrt[gfx12 ? 0x3b1 : 0x32b] = 10;
+            mrt[gfx12 ? 0x327 : 0x3b1] = mrt[gfx12 ? 0x31e : 0x3b0];
+            mrt[gfx12 ? 0x214 : 0x8e] |= 0xf0;
+            mrt[gfx12 ? 0x215 : 0x8f] |= 0xf0;
+            mrt[gfx12 ? 0x195 : 0x1c5] |= 4 << 4;
+            auto mrt_draw = prepare(mrt_state);
+            ASSERT_TRUE(mrt_draw);
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*mrt_draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            for (uint64_t late_page : {uint64_t{0x102}, uint64_t{0x182}}) {
+              const auto entry = table.at(late_page);
+              table.erase(late_page);
+              EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+              EXPECT_EQ(storage, initial);
+              auto faulting = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+              EXPECT_THROW(faulting->advance(*access), std::runtime_error);
+              EXPECT_NE(storage, initial);
+              table[late_page] = entry;
+              std::copy(initial.begin(), initial.end(), storage.begin());
+            }
+            // A first color access failure still follows that pixel's depth write.
+            const auto entry = table.at(0x180);
+            table.erase(0x180);
+            EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::parallel_output(*draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            auto faulting = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+            EXPECT_THROW(faulting->advance(*access), std::runtime_error);
+            uint32_t first_depth = 0;
+            std::memcpy(&first_depth, storage.data(), 4);
+            EXPECT_EQ(first_depth, 0x3f400000u);
+            EXPECT_TRUE(std::equal(storage.begin() + 4, storage.end(), initial.begin() + 4));
+            table[0x180] = entry;
+            std::copy(initial.begin(), initial.end(), storage.begin());
+          }
+
+          std::fesetround(rounding);
+          std::feclearexcept(FE_ALL_EXCEPT);
+          std::feraiseexcept(FE_DIVBYZERO);
+          std::fenv_t before;
+          std::fegetenv(&before);
+          before.__mxcsr |= 2;
+          if (rounding == FE_TOWARDZERO)
+            before.__mxcsr |= 0x8040; // DAZ and FTZ are independent caller controls.
+          std::fesetenv(&before);
+          errno = E2BIG;
+          auto parallel_draw = std::make_shared<amdgpu::GraphicsDraw>(*draw);
+          if (bytes == 4) {
+            ASSERT_TRUE(
+                amdgpu::GraphicsDrawTestAccess::parallel_output(*parallel_draw, *access, pool));
+          } else {
+            // D16 stays serial: compiler vectorization of the conversion can
+            // otherwise change host exception flags in unused SIMD lanes.
+            EXPECT_FALSE(
+                amdgpu::GraphicsDrawTestAccess::parallel_output(*parallel_draw, *access, pool));
+            EXPECT_EQ(storage, initial);
+            EXPECT_FALSE(parallel_draw->advance(*access, &pool, 4));
+          }
+          std::fenv_t parallel_environment;
+          std::fegetenv(&parallel_environment);
+          const int parallel_errno = errno;
+          const auto parallel = storage;
+          uint32_t first = 0;
+          std::memcpy(&first, storage.data() + *first_address - base, bytes);
+          constexpr uint32_t expected32[] = {0x3f000000, 0x3e800000, 0x3f000000, 0x3e800000,
+                                             0x3f400000, 0x3f000000, 0x3f400000, 0x3f000000};
+          constexpr uint32_t expected16[] = {32768, 16384, 32768, 16384,
+                                             49151, 32768, 49151, 32768};
+          EXPECT_EQ(first, bytes == 2 ? expected16[comparison] : expected32[comparison]);
+          if (color && layout == 0 && comparison == 7 && rounding == FE_TONEAREST) {
+            EXPECT_EQ(storage[0x80000], 128u);
+          }
+          std::copy(initial.begin(), initial.end(), storage.begin());
+          std::fesetenv(&before);
+          errno = E2BIG;
+          EXPECT_FALSE(draw->advance(*access));
+          std::fenv_t serial_environment;
+          std::fegetenv(&serial_environment);
+          EXPECT_EQ(errno, parallel_errno);
+          EXPECT_EQ(serial_environment.__control_word, parallel_environment.__control_word);
+          EXPECT_EQ(serial_environment.__status_word & 0x3f,
+                    parallel_environment.__status_word & 0x3f);
+          EXPECT_EQ(serial_environment.__mxcsr, parallel_environment.__mxcsr);
+          EXPECT_EQ(storage, parallel);
+          if (comparison == 0 || (!color && comparison == 2)) {
+            EXPECT_EQ(storage, initial);
+          } else {
+            EXPECT_NE(storage, initial);
+          }
+        }
+      }
+    }
+  }
+#endif
+}
+
+TEST_P(GraphicsExportTest, ParallelRasterPreservesWavePackingAndCallbackEnvironment) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  constexpr uint32_t width = 129, height = 97;
+  // Record the public memory boundary, including status raised by the previous
+  // primitive. A late refusal checks that the same fragment prefix exists.
+  class RecordingMemory final : public amdgpu::PhysicalMemoryAccess {
+  public:
+    amdgpu::GpuMemoryPhysicalAccess backing;
+    std::vector<std::array<uint64_t, 5>> reads;
+    size_t fail_at = SIZE_MAX;
+    explicit RecordingMemory(amdgpu::GpuMemory &memory) : backing(memory) {}
+    amdgpu::VmAccessOutcome read(amdgpu::VmMemoryDomain domain, uint64_t address,
+                                 std::span<std::byte> bytes) override {
+      std::fenv_t environment;
+      std::fegetenv(&environment);
+      reads.push_back({address, environment.__control_word,
+                       uint64_t(environment.__status_word & 0x3f), environment.__mxcsr,
+                       uint64_t(errno)});
+      if (reads.size() == fail_at)
+        return amdgpu::VmAccessOutcome::Faulted;
+      return backing.read(domain, address, bytes);
+    }
+    amdgpu::VmAccessOutcome write(amdgpu::VmMemoryDomain domain, uint64_t address,
+                                  std::span<const std::byte> bytes) override {
+      return backing.write(domain, address, bytes);
+    }
+  };
+  auto recording = std::make_shared<RecordingMemory>(memory_);
+  amdgpu::GpuVm vm;
+  const auto handle = vm.register_address_space(
+      0, std::make_shared<amdgpu::IdentityAddressSpaceTranslator>(), recording, {}, true);
+  auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  amdgpu::CpuDispatchPool pool(4);
+  std::fenv_t saved;
+  std::fegetenv(&saved);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &environment;
+    int error;
+    ~Restore() {
+      std::fesetenv(&environment);
+      errno = error;
+    }
+  } restore{saved, saved_errno};
+  // Give every persistent worker a distinct environment from the caller. The
+  // barrier forces all four pool threads to participate in these checks.
+  std::barrier worker_barrier(4);
+  pool.run_indexed(4, 4, [&](size_t) {
+    std::fesetenv(FE_DFL_ENV);
+    std::fesetround(FE_DOWNWARD);
+    std::feraiseexcept(FE_OVERFLOW);
+    errno = EILSEQ;
+    worker_barrier.arrive_and_wait();
+  });
+  std::fenv_t worker_environment;
+  std::fegetenv(&worker_environment);
+  for (uint32_t kind : {0u, 1u, 2u}) {
+    for (bool wave32 : {false, true}) {
+      for (const auto &[rounding, traps] :
+           {std::pair{FE_TONEAREST, false}, std::pair{FE_DOWNWARD, false},
+            std::pair{FE_UPWARD, false}, std::pair{FE_TOWARDZERO, false},
+            std::pair{FE_TONEAREST, true}}) {
+        SCOPED_TRACE(kind);
+        SCOPED_TRACE(wave32);
+        SCOPED_TRACE(rounding);
+        SCOPED_TRACE(traps);
+        std::fesetenv(FE_DFL_ENV);
+        auto state = rectangle_state();
+        state.uconfig_registers[0x242] = kind == 0 ? 17 : 4;
+        auto &ctx = state.context_registers;
+        ctx[0x10f] = ctx[0x110] = std::bit_cast<uint32_t>(float(width) / 2);
+        ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(float(height) / 2);
+        ctx[0x113] = std::bit_cast<uint32_t>(0.75f);
+        ctx[0x114] = std::bit_cast<uint32_t>(0.125f);
+        ctx[0x90] = 1 | (3 << 16);
+        ctx[0x91] = (width - gfx12) | ((height - gfx12) << 16);
+        ctx[0x30f] = 1; // Half-covered quads retain helper interpolation.
+        ctx[gfx12 ? 0x190 : 0x1b6] = (wave32 ? 1u << 15 : 0) | 1;
+        ctx[gfx12 ? 0x10b : 0x2fa] = ctx[gfx12 ? 0x10d : 0x2fc] = std::bit_cast<uint32_t>(1.0f);
+        if (gfx12)
+          state.sh_registers[0x31] = 1u << 11;
+        ctx[gfx12 ? 0x199 : 0x191] = 0;
+        state.uconfig_registers[0x446] = 0x12340;
+        auto original = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 6);
+        for (uint32_t primitive = 0; primitive < 2; ++primitive) {
+          for (uint32_t vertex = 0; vertex < 3; ++vertex) {
+            const uint32_t index = primitive * 3 + vertex;
+            const float w = kind == 1 ? float(1u << vertex) : 1.0f;
+            const float extent = kind == 2 ? 0.0625f : kind == 1 ? 1.125f : 1.0f;
+            original->export_lane(*wave_, index, 12, 15,
+                                  {std::bit_cast<uint32_t>((vertex == 2 ? extent : -extent) * w),
+                                   std::bit_cast<uint32_t>((vertex == 1 ? extent : -extent) * w),
+                                   std::bit_cast<uint32_t>((0.125f + vertex * 0.125f) * w),
+                                   std::bit_cast<uint32_t>(w)});
+            for (uint32_t component = 0; component < 4; ++component)
+              memory_.write32(0x123400000ull + index * 16 + component * 4,
+                              std::bit_cast<uint32_t>(float(index * 4 + component) / 7));
+          }
+          const uint32_t first = primitive * 3, shift = gfx12 ? 9 : 10;
+          original->export_lane(
+              *wave_, primitive, 20, 1,
+              {first | ((first + 1) << shift) | ((first + 2) << (2 * shift)), 0, 0, 0});
+        }
+        std::fesetround(rounding);
+        std::feraiseexcept(FE_DIVBYZERO);
+        std::fenv_t before;
+        std::fegetenv(&before);
+        before.__mxcsr |= 2; // Include the non-standard denormal sticky flag.
+        if (rounding == FE_TOWARDZERO)
+          before.__mxcsr |= 0x8040; // Also retain DAZ/FTZ controls.
+        if (traps) {
+          before.__control_word &= ~1u;
+          before.__mxcsr &= ~0x80u; // Unmasked invalid operations use the serial path.
+        }
+        for (bool fault : {false, true}) {
+          recording->fail_at = fault ? 13 : SIZE_MAX;
+          std::array<std::vector<uint32_t>, 2> bits;
+          std::array<std::vector<std::array<uint64_t, 5>>, 2> reads;
+          std::array<std::fenv_t, 2> after;
+          std::array<int, 2> errors;
+          std::array<uint32_t, 2> waves{};
+          for (size_t parallel = 0; parallel < 2; ++parallel) {
+            auto draw = std::make_shared<amdgpu::GraphicsDraw>(*original);
+            recording->reads.clear();
+            std::fesetenv(&before);
+            errno = E2BIG;
+            if (fault) {
+              EXPECT_THROW(draw->advance(*access, parallel ? &pool : nullptr, 4),
+                           std::runtime_error);
+            } else {
+              auto dispatch = draw->advance(*access, parallel ? &pool : nullptr, 4);
+              ASSERT_TRUE(dispatch);
+              waves[parallel] = dispatch->total_wgs;
+            }
+            std::fegetenv(&after[parallel]);
+            errors[parallel] = errno;
+            reads[parallel] = recording->reads;
+            bits[parallel] = amdgpu::GraphicsDrawTestAccess::fragment_bits(*draw);
+          }
+          EXPECT_EQ(waves[0], waves[1]);
+          EXPECT_EQ(bits[0], bits[1]);
+          EXPECT_EQ(reads[0], reads[1]);
+          EXPECT_EQ(errors[0], errors[1]);
+          EXPECT_EQ(after[0].__control_word, after[1].__control_word);
+          EXPECT_EQ(after[0].__status_word & 0x3f, after[1].__status_word & 0x3f);
+          EXPECT_EQ(after[0].__mxcsr, after[1].__mxcsr);
+          if (!fault && kind != 2) {
+            EXPECT_GT(waves[0], 100u);
+          }
+        }
+      }
+    }
+  }
+  std::fesetenv(&worker_environment);
+  errno = EILSEQ;
+  // The pool/barrier may leave errno=EAGAIN after a futex wait between
+  // submissions. Caller/callback errno is checked above; persistent worker
+  // controls and sticky FP flags remain observable across these waits.
+  std::array<std::array<uint32_t, 3>, 4> observed{};
+  pool.run_indexed(4, 4, [&](size_t index) {
+    std::fenv_t after;
+    std::fegetenv(&after);
+    observed[index] = {after.__control_word, uint32_t(after.__status_word & 0x3f), after.__mxcsr};
+    worker_barrier.arrive_and_wait();
+  });
+  for (const auto &environment : observed)
+    EXPECT_EQ(environment,
+              (std::array<uint32_t, 3>{worker_environment.__control_word,
+                                       uint32_t(worker_environment.__status_word & 0x3f),
+                                       worker_environment.__mxcsr}));
+#endif
 }
 
 TEST(GraphicsRasterMathTest, InterpolationMatchesPhysicalRdna4QuadInputs) {
@@ -890,6 +1740,323 @@ TEST_P(GraphicsExportTest, ParameterLoadUsesQuadMaskAndPrimitiveOffsets) {
       EXPECT_EQ(wave_->debug_read_vgpr(3, lane), expected) << lane;
     }
   }
+}
+
+TEST_P(GraphicsExportTest, FragmentInitializationPreservesEveryInputMaskAndPadding) {
+  std::fenv_t saved;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  struct Restore {
+    std::fenv_t &saved;
+    ~Restore() { std::fesetenv(&saved); }
+  } restore{saved};
+  ASSERT_EQ(std::fesetround(FE_TONEAREST), 0);
+  constexpr uint32_t input_bits[] = {0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 13, 15};
+  constexpr uint32_t first[] = {0, 2, 4, 6, 9, 11, 13, 15, 16, 17, 18, 19, 20};
+  constexpr uint32_t count[] = {2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1};
+  for (uint32_t wave_size : {32u, 64u}) {
+    wave_->halt();
+    wave_ = cu_->dispatch_wf(0, 0, 106, 32, wave_size);
+    ASSERT_NE(wave_, nullptr);
+    wave_->set_lds(&lds_);
+    wave_->set_lds_base(128);
+    wave_->set_wg_coord(0, 0, 0);
+    amdgpu::GraphicsDraw draw(batch_state(wave_size), GetParam(), 3);
+    amdgpu::GraphicsDrawTestAccess::seed_fragment_inputs(draw, wave_size);
+    for (uint32_t selection = 0; selection < (1u << std::size(input_bits)); ++selection) {
+      SCOPED_TRACE(testing::Message() << wave_size << ',' << selection);
+      uint32_t mask = 0;
+      for (uint32_t input = 0; input < std::size(input_bits); ++input)
+        mask |= ((selection >> input) & 1) << input_bits[input];
+      amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, mask);
+      for (uint32_t reg = 0; reg < 22; ++reg)
+        for (uint32_t lane = 0; lane < wave_size; ++lane)
+          wave_->debug_write_vgpr(reg, lane, 0xdeadbeef);
+      draw.initialize(*wave_, 0, 0);
+      EXPECT_EQ(wave_->exec(), 0xa5u);
+      EXPECT_EQ(wave_->debug_read_sgpr(0), 0x76543210u);
+      EXPECT_EQ(wave_->debug_read_sgpr(1), 0xfedcba98u);
+      EXPECT_EQ(wave_->debug_read_sgpr(2), 128u);
+      EXPECT_EQ(lds_.read32(128), 0x01234567u);
+      EXPECT_EQ(lds_.read32(132), 0x89abcdefu);
+      EXPECT_EQ(lds_.read32(136), 0x7f801234u);
+      for (uint32_t lane = 0; lane < wave_size; ++lane) {
+        const bool populated = lane < 8; // Includes helper lanes with EXEC clear.
+        const uint32_t i = populated ? 0x3f000001u + lane : 0;
+        const uint32_t j = populated ? 0x80000000u | lane : 0;
+        const uint32_t linear_i = populated ? 1u + lane : 0;
+        const uint32_t linear_j = populated ? 0xbf800000u + lane : 0;
+        const int32_t x = populated ? int32_t(lane) - 3 : 0;
+        const int32_t y = populated ? 2 - int32_t(lane) : 0;
+        const std::array<uint32_t, 21> canonical{i,
+                                                 j,
+                                                 i,
+                                                 j,
+                                                 i,
+                                                 j,
+                                                 populated ? 0x7f800001u + lane : 0,
+                                                 populated ? 0x80000000u : 0,
+                                                 populated ? 0x3f800000u : 0,
+                                                 linear_i,
+                                                 linear_j,
+                                                 linear_i,
+                                                 linear_j,
+                                                 linear_i,
+                                                 linear_j,
+                                                 std::bit_cast<uint32_t>(float(x) + 0.5f),
+                                                 std::bit_cast<uint32_t>(float(y) + 0.5f),
+                                                 populated ? 0x7fc00000u + lane : 0,
+                                                 populated ? 0x3f800000u : 0x7f800000u,
+                                                 0x12340000u,
+                                                 (uint32_t(x) & 0xffff) | (uint32_t(y) << 16)};
+        std::array<uint32_t, 22> expected, actual;
+        expected.fill(0xdeadbeef);
+        uint32_t reg = 0;
+        for (uint32_t input = 0; input < std::size(input_bits); ++input)
+          if (selection & (1u << input))
+            for (uint32_t component = 0; component < count[input]; ++component)
+              expected[reg++] = canonical[first[input] + component];
+        for (uint32_t r = 0; r < actual.size(); ++r)
+          actual[r] = wave_->debug_read_vgpr(r, lane);
+        EXPECT_EQ(actual, expected) << lane;
+      }
+    }
+  }
+}
+
+TEST_P(GraphicsExportTest, FragmentInitializationKeepsFallbackAndHostState) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  class Observer final : public ExecutionPlugin {
+  public:
+    Observer() : ExecutionPlugin("fragment_initialization") {}
+    uint32_t writes = 0;
+    void onAmdgpuWriteVgprLanes(const amdgpu::Wavefront *, uint32_t, uint64_t, uint8_t) override {
+      ++writes;
+    }
+  };
+  auto plugins = std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{});
+  auto observer = std::make_unique<Observer>();
+  auto *observed = observer.get();
+  plugins->add(std::move(observer));
+  cu_->set_plugin_group(plugins);
+  std::fenv_t saved;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &saved;
+    int error;
+    ~Restore() {
+      std::fesetenv(&saved);
+      errno = error;
+    }
+  } restore{saved, saved_errno};
+  for (uint32_t wave_size : {32u, 64u}) {
+    amdgpu::GraphicsDraw draw(batch_state(wave_size), GetParam(), 3);
+    amdgpu::GraphicsDrawTestAccess::seed_fragment_inputs(draw, wave_size);
+    for (uint32_t mask : {0u, 0x7fu, 0xaf7fu}) {
+      amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, mask);
+      for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        for (uint32_t flush : {0u, 0x40u, 0x8000u, 0x8040u}) {
+          std::array<uint32_t, 22 * 64> expected{};
+          for (uint32_t allocated : {32u, 1u}) {
+            wave_->halt();
+            wave_ = cu_->dispatch_wf(0, 0, 106, allocated, wave_size);
+            ASSERT_NE(wave_, nullptr);
+            wave_->set_lds(&lds_);
+            wave_->set_wg_coord(0, 0, 0);
+            ASSERT_EQ(std::fesetround(rounding), 0);
+            std::fenv_t before;
+            ASSERT_EQ(std::fegetenv(&before), 0);
+            before.__mxcsr = (before.__mxcsr & ~0x8040u) | flush;
+            ASSERT_EQ(std::fesetenv(&before), 0);
+            ASSERT_EQ(std::feclearexcept(FE_ALL_EXCEPT), 0);
+            ASSERT_EQ(std::feraiseexcept(FE_OVERFLOW), 0);
+            ASSERT_EQ(std::fegetenv(&before), 0);
+            const int before_flags = std::fetestexcept(FE_ALL_EXCEPT);
+            errno = EDOM;
+            draw.initialize(*wave_, 0, 0);
+            const int error = errno;
+            std::fenv_t after;
+            ASSERT_EQ(std::fegetenv(&after), 0);
+            EXPECT_EQ(error, EDOM);
+            EXPECT_EQ(after.__control_word, before.__control_word);
+            EXPECT_EQ(after.__mxcsr & ~0x3fu, before.__mxcsr & ~0x3fu);
+            // Padding lanes evaluate 1/0 even when no position input is enabled.
+            EXPECT_EQ(std::fetestexcept(FE_ALL_EXCEPT), before_flags | FE_DIVBYZERO);
+            EXPECT_EQ(observed->writes, 0u);
+            for (uint32_t reg = 0; reg < 22; ++reg)
+              for (uint32_t lane = 0; lane < wave_size; ++lane) {
+                const uint32_t bits = wave_->debug_read_vgpr(reg, lane);
+                if (allocated == 32) {
+                  expected[reg * 64 + lane] = bits;
+                } else {
+                  EXPECT_EQ(bits, expected[reg * 64 + lane]) << reg << ',' << lane;
+                }
+              }
+          }
+        }
+      }
+    }
+  }
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST(GraphicsFragmentInitializationTest, FirstTouchKeepsChunkAndArithmeticOrder) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  using Base = amdgpu::IsaExecComputeUnit<simdojo::ExecMode::FUNCTIONAL, rdna3::Isa>;
+  class RecordingCu final : public Base {
+  public:
+    using Base::Base;
+    using Base::raw_vgpr_data;
+    struct Touch {
+      uint32_t reg;
+      size_t chunks;
+      int flags;
+    };
+    std::array<Touch, 21> touches{};
+    size_t count = 0;
+    uint8_t *raw_vgpr_data(uint32_t reg) override {
+      if (count < touches.size())
+        touches[count] = {reg, vgpr_file().materialized_chunk_count(),
+                          std::fetestexcept(FE_ALL_EXCEPT)};
+      ++count;
+      return Base::raw_vgpr_data(reg);
+    }
+  };
+  amdgpu::GpuMemory memory("fragment_initialization");
+  amdgpu::L2Cache cache("fragment_initialization_cache");
+  cache.set_backing_memory(&memory);
+  amdgpu::Lds lds(4);
+  amdgpu::ComputeUnitCore::Config config{};
+  config.arch = ROCJITSU_CODE_ARCH_RDNA3;
+  config.num_wf_slots = 1;
+  config.sgprs_per_wf = 106;
+  config.vgprs_per_wf = 256;
+  RecordingCu cu("recording", config, &memory, &cache);
+  amdgpu::Pm4QueueState state;
+  state.num_instances = 1;
+  state.uconfig_registers[0x242] = 17;
+  amdgpu::GraphicsDraw draw(state, config.arch, 3);
+  amdgpu::GraphicsDrawTestAccess::seed_fragment_inputs(draw, 64, true);
+  amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, 0xaf7f);
+  std::fenv_t saved;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  struct Restore {
+    std::fenv_t &saved;
+    ~Restore() { std::fesetenv(&saved); }
+  } restore{saved};
+  for (uint32_t reuse = 0; reuse < 2; ++reuse) {
+    auto *wave = cu.dispatch_wf(0, 0, 106, 32, 64);
+    ASSERT_NE(wave, nullptr);
+    wave->set_lds(&lds);
+    wave->set_wg_coord(0, 0, 0);
+    EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 0u);
+    ASSERT_TRUE(wave->initialization_vgpr_lanes(32).empty());
+    EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 0u);
+    cu.count = 0;
+    ASSERT_EQ(std::feclearexcept(FE_ALL_EXCEPT), 0);
+    draw.initialize(*wave, 0, 0);
+    ASSERT_EQ(cu.count, 21u);
+    for (uint32_t reg = 0; reg < cu.touches.size(); ++reg) {
+      EXPECT_EQ(cu.touches[reg].reg, reg);
+      EXPECT_EQ(cu.touches[reg].chunks, reg == 0 ? 0u : reg <= 16 ? 1u : 2u);
+      EXPECT_EQ(cu.touches[reg].flags, reg < 15 ? 0 : FE_DIVBYZERO);
+    }
+    EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 2u);
+    // Early pointers must still address their own lanes after the second chunk appears.
+    EXPECT_EQ(wave->debug_read_vgpr(0, 7), 0x3f000008u);
+    EXPECT_EQ(wave->debug_read_vgpr(18, 0), 0x7f800000u);
+    EXPECT_EQ(wave->debug_read_vgpr(20, 7), 0xfffb0004u);
+    wave->halt();
+  }
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST(GraphicsFragmentInitializationTest, OutOfFileFallbackKeepsDroppedWrites) {
+  using Base = amdgpu::IsaExecComputeUnit<simdojo::ExecMode::FUNCTIONAL, rdna3::Isa>;
+  class Cu final : public Base {
+  public:
+    using Base::Base;
+    using Base::raw_vgpr_data;
+    bool refuse_storage = false;
+    uint32_t storage_requests = 0;
+    uint8_t *raw_vgpr_data(uint32_t reg) override {
+      ++storage_requests;
+      return refuse_storage ? nullptr : Base::raw_vgpr_data(reg);
+    }
+  };
+  amdgpu::GpuMemory memory("fragment_bounds");
+  amdgpu::L2Cache cache("fragment_bounds_cache");
+  cache.set_backing_memory(&memory);
+  amdgpu::Lds lds(4);
+  amdgpu::ComputeUnitCore::Config config{};
+  config.arch = ROCJITSU_CODE_ARCH_RDNA3;
+  config.num_wf_slots = 1;
+  config.sgprs_per_wf = 106;
+  config.vgprs_per_wf = 16;
+  Cu cu("bounded", config, &memory, &cache);
+  auto *wave = cu.dispatch_wf(0, 0, 106, 16, 64);
+  ASSERT_NE(wave, nullptr);
+  wave->set_lds(&lds);
+  wave->set_wg_coord(0, 0, 0);
+  EXPECT_TRUE(wave->initialization_vgpr_lanes(16).empty());
+  EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 0u);
+  amdgpu::Pm4QueueState state;
+  state.num_instances = 1;
+  state.uconfig_registers[0x242] = 17;
+  amdgpu::GraphicsDraw draw(state, config.arch, 3);
+  amdgpu::GraphicsDrawTestAccess::seed_fragment_inputs(draw, 64);
+  amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, 0xaf7f);
+  std::fenv_t saved;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  struct Restore {
+    std::fenv_t &saved;
+    ~Restore() { std::fesetenv(&saved); }
+  } restore{saved};
+  draw.initialize(*wave, 0, 0);
+  EXPECT_EQ(wave->debug_read_vgpr(0, 7), 0x3f000008u);
+  EXPECT_EQ(wave->debug_read_vgpr(16, 0), 0u);
+  EXPECT_EQ(wave->debug_read_vgpr(20, 7), 0u);
+  EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 1u);
+  wave->halt();
+  // A custom CU may decline raw storage while supporting its ordinary writes.
+  wave = cu.dispatch_wf(0, 0, 106, 16, 64);
+  ASSERT_NE(wave, nullptr);
+  wave->set_lds(&lds);
+  wave->set_wg_coord(0, 0, 0);
+  cu.refuse_storage = true;
+  EXPECT_TRUE(wave->initialization_vgpr_lanes(0).empty());
+  EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 0u);
+  cu.storage_requests = 0;
+  amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, 0);
+  draw.initialize(*wave, 0, 0);
+  EXPECT_EQ(cu.storage_requests, 0u);
+  amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, 0xaf7f);
+  draw.initialize(*wave, 0, 0);
+  EXPECT_EQ(cu.storage_requests, 16u);
+  EXPECT_EQ(wave->debug_read_vgpr(0, 7), 0x3f000008u);
+  EXPECT_EQ(wave->debug_read_vgpr(15, 0), std::bit_cast<uint32_t>(-2.5f));
+  EXPECT_EQ(wave->debug_read_vgpr(20, 7), 0u);
+  wave->halt();
+#ifdef NDEBUG
+  // RegisterFile's oversized-request assertion is absent in release builds.
+  // Retain the old dropped-write behavior even for this malformed dispatch.
+  cu.refuse_storage = false;
+  wave = cu.dispatch_wf(0, 0, 106, 32, 64);
+  ASSERT_NE(wave, nullptr);
+  wave->set_lds(&lds);
+  wave->set_wg_coord(0, 0, 0);
+  EXPECT_TRUE(wave->initialization_vgpr_lanes(16).empty());
+  EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 0u);
+  draw.initialize(*wave, 0, 0);
+  EXPECT_EQ(wave->debug_read_vgpr(0, 7), 0x3f000008u);
+  EXPECT_EQ(wave->debug_read_vgpr(20, 7), 0u);
+  EXPECT_EQ(cu.vgpr_file().materialized_chunk_count(), 1u);
+  wave->halt();
+#endif
 }
 
 TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
@@ -1603,6 +2770,875 @@ TEST_P(GraphicsExportTest, MergedVertexGroupCountsIncludeTrailingVertices) {
   }
 }
 
+TEST_P(GraphicsExportTest, AttributeWordGatherMatchesSelectedBitsAndHostEnvironment) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  KfdProcess process(7);
+  std::vector<uint8_t> ring(65536);
+  constexpr uint64_t base = 0x10000;
+  constexpr auto sealed = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+  process.map_pages(base, ring.data(), ring.size(), amdgpu::Mtype::RW, sealed);
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+  const auto handle = adapter.register_address_space(
+      7, {.page_table = &process.page_table_,
+          .page_table_mutex = &process.page_table_mutex_,
+          .page_table_generation = process.page_table_generation(),
+          .request_mutex = process.page_table_request_mutex(),
+          .mutation_epoch = process.page_table_mutation_epoch(),
+          .page_table_cache_state = process.page_table_cache_state()});
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  constexpr uint32_t values[] = {0,          0x80000000, 1,          0x007fffff, 0x3f000001,
+                                 0x7f800000, 0xff800000, 0x7fc01234, 0x7f801234, 0xbf800000};
+  for (size_t i = 0; i < ring.size(); i += 4)
+    std::memcpy(ring.data() + i, &values[(i / 4) % std::size(values)], 4);
+  std::fenv_t saved;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &environment;
+    int error;
+    ~Restore() {
+      std::fesetenv(&environment);
+      errno = error;
+    }
+  } restore{saved, saved_errno};
+  for (uint32_t attributes : {1u, 2u, 32u}) {
+    for (uint32_t stride : {16u, 512u}) {
+      for (uint32_t offset : {0u, 32768u}) {
+        auto state = batch_state(64);
+        state.uconfig_registers[0x242] = 6; // A full 64-vertex triangle-strip group.
+        if (gfx12) {
+          state.sh_registers[0x31] = (attributes << 11) | (stride / 16 - 1);
+        } else {
+          state.context_registers[0x1b1] = (stride / 16 - 1) << 1;
+          state.context_registers[0x1b6] = (1u << 15) | attributes;
+        }
+        const uint32_t controls[] = {0, 0x400 | 31, 0x420 | 31, 0x320, 31};
+        for (uint32_t a = 0; a < attributes; ++a)
+          state.context_registers[(gfx12 ? 0x199 : 0x191) + a] = controls[a % std::size(controls)];
+        amdgpu::GraphicsDraw draw(state, GetParam(), 64);
+        constexpr std::array<uint32_t, 3> indices{63, 0, 31};
+        constexpr uint32_t provoking = 32;
+        std::vector<uint32_t> expected(attributes * 12), actual(attributes * 12);
+        for (uint32_t a = 0; a < attributes; ++a) {
+          const uint32_t control = controls[a % std::size(controls)];
+          const bool passthrough = (control & 0x420) == 0x420;
+          const bool flat = (control & 0x400) && !passthrough;
+          for (uint32_t c = 0; c < 4; ++c)
+            for (uint32_t k = 0; k < 3; ++k) {
+              auto &word = expected[a * 12 + c * 3 + k];
+              if ((control & 32) && !passthrough) {
+                word = ((control >> 8) & (c == 3 ? 1u : 2u)) ? 0x3f800000 : 0;
+              } else {
+                const auto address = amdgpu::addr_calc::rdna_buffer_address(
+                    3u << 30, 2u << 21, stride, true, flat ? provoking : indices[k],
+                    (control & 31) * 16 + c * 4, 0, 0);
+                ASSERT_EQ(access->read(base + offset + address.offset,
+                                       {reinterpret_cast<std::byte *>(&word), 4}),
+                          amdgpu::VmAccessOutcome::Complete);
+              }
+            }
+        }
+        for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+          for (uint32_t modifiers : {0u, 0x8040u}) {
+            ASSERT_EQ(std::fesetround(rounding), 0);
+            ASSERT_EQ(std::feraiseexcept(FE_INVALID | FE_DIVBYZERO), 0);
+            std::fenv_t before;
+            ASSERT_EQ(std::fegetenv(&before), 0);
+            before.__mxcsr = (before.__mxcsr & ~0x8040u) | modifiers;
+            ASSERT_EQ(std::fesetenv(&before), 0);
+            errno = EDOM;
+            const bool gathered = amdgpu::GraphicsDrawTestAccess::gather_attributes(
+                draw, *access, indices, provoking, actual, offset);
+            const int error = errno;
+            std::fenv_t after;
+            ASSERT_EQ(std::fegetenv(&after), 0);
+            EXPECT_TRUE(gathered);
+            EXPECT_EQ(actual, expected);
+            EXPECT_EQ(error, EDOM);
+            EXPECT_EQ(after.__control_word, before.__control_word);
+            EXPECT_EQ(after.__status_word, before.__status_word);
+            EXPECT_EQ(after.__mxcsr, before.__mxcsr);
+          }
+        }
+      }
+    }
+  }
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, AttributeWordGatherRefusesWithoutFaultsAndDefaultsNeedNoBacking) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  struct Reporter final : amdgpu::MemoryFaultReporter {
+    uint32_t calls = 0;
+    void report_memory_fault(uint32_t, uint64_t, amdgpu::MemoryFaultCause) override { ++calls; }
+  } reporter;
+  std::fenv_t saved, masked;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  ASSERT_EQ(std::fegetenv(&masked), 0);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &environment;
+    int error;
+    ~Restore() {
+      std::fesetenv(&environment);
+      errno = error;
+    }
+  } restore{saved, saved_errno};
+  for (uint32_t variant = 0; variant < 8; ++variant) {
+    SCOPED_TRACE(variant);
+    KfdProcess process(7);
+    std::array<uint8_t, 4096> backing{};
+    constexpr auto sealed = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+    const auto owner = variant == 3   ? amdgpu::LegacyHostExtentOwner::Driver
+                       : variant == 4 ? amdgpu::LegacyHostExtentOwner::Application
+                                      : sealed;
+    if (variant != 0) {
+      process.map_pages(0x10000, backing.data(), variant == 2 ? 32 : backing.size(),
+                        amdgpu::Mtype::RW, owner);
+    }
+    if (variant == 1) {
+      process.page_table_.at(0x10).host_extents = {{backing.data(), 2, 0, sealed},
+                                                   {backing.data() + 2, 4094, 2, sealed}};
+    }
+    amdgpu::GpuVm vm;
+    amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+    const auto handle = adapter.register_address_space(
+        7, {.page_table = &process.page_table_,
+            .page_table_mutex = &process.page_table_mutex_,
+            .page_table_generation = process.page_table_generation(),
+            .request_mutex = process.page_table_request_mutex(),
+            .mutation_epoch = process.page_table_mutation_epoch(),
+            .page_table_cache_state = process.page_table_cache_state(),
+            .fault_reporter = &reporter});
+    const auto access = vm.snapshot(handle);
+    ASSERT_TRUE(access);
+    auto state = batch_state();
+    if (gfx12) {
+      state.sh_registers[0x31] = 1u << 11;
+    } else {
+      state.context_registers[0x1b6] = (1u << 15) | 1u;
+    }
+    state.context_registers[gfx12 ? 0x199 : 0x191] = variant == 0   ? 0x320
+                                                     : variant == 6 ? 0x80000000
+                                                                    : 0;
+    amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+    std::array<uint32_t, 12> words{};
+    if (variant == 7) {
+      ASSERT_NE(feenableexcept(FE_DIVBYZERO), -1);
+    }
+    errno = EDOM;
+    const bool gathered = amdgpu::GraphicsDrawTestAccess::gather_attributes(
+        draw, *access, {0, 1, 2}, 0, words, 0,
+        variant == 5 ? std::optional<uint64_t>{UINT64_MAX - 8} : std::nullopt);
+    const int error = errno;
+    ASSERT_EQ(std::fesetenv(&masked), 0);
+    EXPECT_FALSE(gathered);
+    EXPECT_EQ(reporter.calls, 0u);
+    EXPECT_EQ(error, EDOM);
+    if (variant == 0) {
+      EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0; }));
+      export_rectangle_vertices(draw);
+      EXPECT_TRUE(draw.advance(*access, nullptr, 1, true));
+      EXPECT_EQ(reporter.calls, 0u);
+    }
+  }
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, AttributeWordGatherPreservesLateFaultFlagsAndParameterBits) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  struct Observed {
+    uint64_t address;
+    int error;
+    uint16_t control, status;
+    uint32_t mxcsr;
+    bool operator==(const Observed &) const = default;
+  };
+  struct Reporter final : amdgpu::MemoryFaultReporter {
+    std::vector<Observed> observations;
+    KfdProcess *process = nullptr;
+    uint8_t *repair = nullptr;
+    void report_memory_fault(uint32_t, uint64_t address, amdgpu::MemoryFaultCause) override {
+      const int error = errno;
+      std::fenv_t environment;
+      std::fegetenv(&environment);
+      observations.push_back({address, error, environment.__control_word, environment.__status_word,
+                              environment.__mxcsr});
+      // A refused gather must release all admission before the ordinary fault
+      // callback, including when that callback changes this same mapping.
+      if (process)
+        process->map_pages(0x10000, repair, 4096, amdgpu::Mtype::RW,
+                           amdgpu::LegacyHostExtentOwner::DriverSealedRam);
+    }
+  };
+  std::fenv_t saved, masked;
+  ASSERT_EQ(std::feholdexcept(&saved), 0);
+  ASSERT_EQ(std::fegetenv(&masked), 0);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &environment;
+    int error;
+    ~Restore() {
+      std::fesetenv(&environment);
+      errno = error;
+    }
+  } restore{saved, saved_errno};
+  for (uint32_t variant = 0; variant < 4; ++variant) {
+    SCOPED_TRACE(variant);
+    std::vector<Observed> expected_observations;
+    std::vector<uint32_t> expected_fragments;
+    std::fenv_t expected_environment;
+    int expected_errno = 0;
+    for (bool gathered : {false, true}) {
+      KfdProcess process(7);
+      std::array<uint32_t, 1024> ring;
+      ring.fill(0x7f800000); // Attribute differences raise invalid before the later fault.
+      Reporter reporter;
+      if (variant == 1) {
+        reporter.process = &process;
+        reporter.repair = reinterpret_cast<uint8_t *>(ring.data());
+      }
+      const auto owner = variant == 3 ? amdgpu::LegacyHostExtentOwner::Application
+                                      : amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+      process.map_pages(0x10000, reinterpret_cast<uint8_t *>(ring.data()),
+                        variant == 1 ? 512 : sizeof(ring), amdgpu::Mtype::RW, owner);
+      amdgpu::GpuVm vm;
+      amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+      const auto handle = adapter.register_address_space(
+          7, {.page_table = &process.page_table_,
+              .page_table_mutex = &process.page_table_mutex_,
+              .page_table_generation = process.page_table_generation(),
+              .request_mutex = process.page_table_request_mutex(),
+              .mutation_epoch = process.page_table_mutation_epoch(),
+              .page_table_cache_state = process.page_table_cache_state(),
+              .fault_reporter = &reporter});
+      const auto access = vm.snapshot(handle);
+      ASSERT_TRUE(access);
+      auto state = batch_state();
+      if (gfx12) {
+        state.sh_registers[0x31] = 2u << 11;
+      } else {
+        state.context_registers[0x1b6] = (1u << 15) | 2u;
+      }
+      state.context_registers[gfx12 ? 0x199 : 0x191] = 0;
+      state.context_registers[gfx12 ? 0x19a : 0x192] = variant == 2 ? 0x80000000 : 1;
+      amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+      export_rectangle_vertices(draw);
+      ASSERT_EQ(std::fesetenv(&masked), 0);
+      ASSERT_EQ(std::feclearexcept(FE_ALL_EXCEPT), 0);
+      ASSERT_EQ(std::feraiseexcept(FE_DIVBYZERO), 0);
+      errno = EDOM;
+      bool failed = false;
+      try {
+        EXPECT_TRUE(draw.advance(*access, nullptr, 1, gathered));
+      } catch (const std::runtime_error &) {
+        failed = true;
+      }
+      const int error = errno;
+      std::fenv_t environment;
+      ASSERT_EQ(std::fegetenv(&environment), 0);
+      EXPECT_EQ(failed, variant == 1 || variant == 2);
+      EXPECT_TRUE(environment.__mxcsr & FE_INVALID);
+      if (variant == 1) {
+        ASSERT_EQ(reporter.observations.size(), 1u);
+        EXPECT_TRUE(reporter.observations[0].mxcsr & FE_INVALID);
+      } else {
+        EXPECT_TRUE(reporter.observations.empty());
+      }
+      const auto fragments = amdgpu::GraphicsDrawTestAccess::fragment_bits(draw);
+      if (!gathered) {
+        expected_observations = reporter.observations;
+        expected_fragments = fragments;
+        expected_environment = environment;
+        expected_errno = error;
+      } else {
+        EXPECT_EQ(reporter.observations, expected_observations);
+        EXPECT_EQ(fragments, expected_fragments);
+        EXPECT_EQ(environment.__control_word, expected_environment.__control_word);
+        EXPECT_EQ(environment.__status_word, expected_environment.__status_word);
+        EXPECT_EQ(environment.__mxcsr, expected_environment.__mxcsr);
+        EXPECT_EQ(error, expected_errno);
+      }
+    }
+  }
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, AttributeWordGatherRefusesCustomBackingAndRetainsOriginalReads) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  const auto handle = vm.register_address_space(0, backing, backing);
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  auto state = batch_state();
+  if (gfx12) {
+    state.sh_registers[0x31] = 1u << 11;
+  } else {
+    state.context_registers[0x1b6] = (1u << 15) | 1u;
+  }
+  std::vector<uint32_t> expected;
+  uint64_t expected_reads = 0;
+  for (bool enabled : {false, true}) {
+    amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+    std::array<uint32_t, 12> words;
+    words.fill(0x12345678);
+    EXPECT_FALSE(
+        amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *access, {0, 1, 2}, 0, words));
+    EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0x12345678; }));
+    EXPECT_EQ(backing->reads, 0u);
+    export_rectangle_vertices(draw);
+    ASSERT_TRUE(draw.advance(*access, nullptr, 1, enabled));
+    const auto fragments = amdgpu::GraphicsDrawTestAccess::fragment_bits(draw);
+    if (!enabled) {
+      expected = fragments;
+      expected_reads = backing->reads;
+      EXPECT_GT(expected_reads, 0u);
+    } else {
+      EXPECT_EQ(fragments, expected);
+      EXPECT_EQ(backing->reads, expected_reads);
+    }
+    EXPECT_EQ(backing->ram_lease_requests, 0u);
+    backing->reads = 0;
+  }
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, AttributeWordGatherRefusesReplacedRawRegistration) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  KfdProcess original(7), replacement(7);
+  std::array<uint32_t, 1024> old_words{}, new_words{};
+  old_words.fill(0x3f800000);
+  new_words.fill(0x40000000);
+  constexpr auto sealed = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+  original.map_pages(0x10000, reinterpret_cast<uint8_t *>(old_words.data()), sizeof(old_words),
+                     amdgpu::Mtype::RW, sealed);
+  replacement.map_pages(0x10000, reinterpret_cast<uint8_t *>(new_words.data()), sizeof(new_words),
+                        amdgpu::Mtype::RW, sealed);
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+  const auto handle = adapter.register_address_space(
+      7, {.page_table = &original.page_table_,
+          .page_table_mutex = &original.page_table_mutex_,
+          .page_table_generation = original.page_table_generation(),
+          .request_mutex = original.page_table_request_mutex(),
+          .mutation_epoch = original.page_table_mutation_epoch(),
+          .page_table_cache_state = original.page_table_cache_state()});
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  auto state = batch_state();
+  if (gfx12) {
+    state.sh_registers[0x31] = 1u << 11;
+  } else {
+    state.context_registers[0x1b6] = (1u << 15) | 1u;
+  }
+  amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+  std::array<uint32_t, 12> words{};
+  ASSERT_TRUE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *access, {0, 1, 2}, 0, words));
+  EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0x3f800000; }));
+  const auto space = adapter.address_space_snapshot(7);
+  ASSERT_TRUE(space);
+  space->register_process(7, &replacement.page_table_, &replacement.page_table_mutex_,
+                          replacement.page_table_generation(),
+                          replacement.page_table_request_mutex(),
+                          replacement.page_table_cache_state());
+  EXPECT_FALSE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *access, {0, 1, 2}, 0, words));
+  EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0x3f800000; }));
+  uint32_t current = 0;
+  EXPECT_EQ(access->read(0x10000, {reinterpret_cast<std::byte *>(&current), sizeof(current)}),
+            amdgpu::VmAccessOutcome::Complete);
+  EXPECT_EQ(current, 0x40000000u);
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, AttributeWordGatherRetainsOnlyNegativeAdmissionResults) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  KfdProcess process(7);
+  std::array<uint32_t, 1024> first{}, second{};
+  first.fill(0x3f800000);
+  second.fill(0x40000000);
+  constexpr auto sealed = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+  process.map_pages(0x10000, reinterpret_cast<uint8_t *>(first.data()), sizeof(first),
+                    amdgpu::Mtype::RW, sealed);
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter(vm, &memory_);
+  const auto handle = adapter.register_address_space(
+      7, {.page_table = &process.page_table_,
+          .page_table_mutex = &process.page_table_mutex_,
+          .page_table_generation = process.page_table_generation(),
+          .request_mutex = process.page_table_request_mutex(),
+          .mutation_epoch = process.page_table_mutation_epoch(),
+          .page_table_cache_state = process.page_table_cache_state()});
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  ASSERT_TRUE(access->supports_ram_word_reads());
+  auto state = batch_state();
+  if (gfx12) {
+    state.sh_registers[0x31] = 1u << 11;
+  } else {
+    state.context_registers[0x1b6] = (1u << 15) | 1u;
+  }
+  amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+  std::array<uint32_t, 12> words{};
+  ASSERT_TRUE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *access, {0, 1, 2}, 0, words));
+  EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0x3f800000; }));
+  process.map_pages(0x10000, reinterpret_cast<uint8_t *>(second.data()), sizeof(second),
+                    amdgpu::Mtype::RW, amdgpu::LegacyHostExtentOwner::Application);
+  EXPECT_FALSE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *access, {0, 1, 2}, 0, words));
+  EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0x3f800000; }));
+  process.map_pages(0x10000, reinterpret_cast<uint8_t *>(second.data()), sizeof(second),
+                    amdgpu::Mtype::RW, sealed);
+  // A later eligible mapping need not revive the optional path for this draw.
+  EXPECT_FALSE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *access, {0, 1, 2}, 0, words));
+  amdgpu::GraphicsDraw fresh(state, GetParam(), 3);
+  ASSERT_TRUE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(fresh, *access, {0, 1, 2}, 0, words));
+  EXPECT_TRUE(std::ranges::all_of(words, [](uint32_t word) { return word == 0x40000000; }));
+  export_rectangle_vertices(draw);
+  export_rectangle_vertices(fresh);
+  ASSERT_TRUE(draw.advance(*access, nullptr, 1, true));
+  ASSERT_TRUE(fresh.advance(*access, nullptr, 1, false));
+  EXPECT_EQ(amdgpu::GraphicsDrawTestAccess::fragment_bits(draw),
+            amdgpu::GraphicsDrawTestAccess::fragment_bits(fresh));
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, AttributeWordGatherCapabilityFollowsAccessStateReplacement) {
+#if defined(__GLIBC__) && defined(__x86_64__)
+  class Translator final : public amdgpu::AddressSpaceTranslator {
+  public:
+    explicit Translator(bool supported) : AddressSpaceTranslator(supported) {}
+    mutable uint32_t translations = 0, copies = 0;
+    amdgpu::VmTranslationResult translate(uint64_t address, size_t size,
+                                          amdgpu::VmAccessKind access) const override {
+      ++translations;
+      return amdgpu::IdentityAddressSpaceTranslator{}.translate(address, size, access);
+    }
+    bool try_read_ram_words(amdgpu::PhysicalMemoryAccess &, amdgpu::VmRamRange,
+                            std::span<const amdgpu::VmRamWordRead>) const override {
+      ++copies;
+      return false;
+    }
+  };
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  auto unsupported = std::make_shared<Translator>(false);
+  amdgpu::GpuVm vm;
+  const auto handle = vm.register_address_space(7, unsupported, backing);
+  const auto old = vm.snapshot(handle);
+  ASSERT_TRUE(old);
+  EXPECT_FALSE(old->supports_ram_word_reads());
+  auto state = batch_state();
+  if (gfx12) {
+    state.sh_registers[0x31] = 1u << 11;
+  } else {
+    state.context_registers[0x1b6] = (1u << 15) | 1u;
+  }
+  amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+  std::array<uint32_t, 12> words{};
+  EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *old, {0, 1, 2}, 0, words));
+  EXPECT_EQ(unsupported->copies, 0u);
+  EXPECT_EQ(unsupported->translations, 0u);
+  auto supported = std::make_shared<Translator>(true);
+  ASSERT_TRUE(vm.replace_translated(handle, supported, backing));
+  const auto current = vm.snapshot(handle);
+  ASSERT_TRUE(current);
+  EXPECT_TRUE(current->supports_ram_word_reads());
+  EXPECT_FALSE(old->supports_ram_word_reads());
+  EXPECT_FALSE(amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *old, {0, 1, 2}, 0, words));
+  EXPECT_EQ(supported->copies, 0u);
+  EXPECT_FALSE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *current, {0, 1, 2}, 0, words));
+  EXPECT_EQ(supported->copies, 1u); // Capability does not grant a successful copy.
+  EXPECT_FALSE(
+      amdgpu::GraphicsDrawTestAccess::gather_attributes(draw, *current, {0, 1, 2}, 0, words));
+  EXPECT_EQ(supported->copies, 1u); // This draw remembers the admission refusal.
+  EXPECT_EQ(supported->translations, 0u);
+  EXPECT_EQ(backing->reads, 0u);
+#else
+  GTEST_SKIP();
+#endif
+}
+
+TEST_P(GraphicsExportTest, VertexBatchGateRejectsAliasesUnknownRingAndOrderedModes) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  uint32_t faults = 0;
+  auto handle =
+      vm.register_address_space(0, std::make_shared<amdgpu::IdentityAddressSpaceTranslator>(),
+                                backing, [&](uint64_t, amdgpu::VmAccessKind) { ++faults; });
+  auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  for (uint32_t mode = 0; mode < 14; ++mode) {
+    SCOPED_TRACE(mode);
+    auto state = batch_state();
+    backing->alias_page.reset();
+    backing->missing_page.reset();
+    backing->identity_available = true;
+    switch (mode) {
+    case 1:
+      state.context_registers[gfx12 ? 0x2a6 : 0x2d5] |= 1u << 24;
+      break;
+    case 2:
+      state.context_registers[gfx12 ? 0x1b : 0x203] |= 1u << 16;
+      break;
+    case 3:
+      state.sh_registers[0xb] |= 1u << 25;
+      break;
+    case 4:
+      state.sh_registers[0x8b] |= 1u << 6;
+      break;
+    case 5:
+      state.uconfig_registers[0x446] = 0;
+      break;
+    case 6:
+      backing->identity_available = false;
+      break;
+    case 7:
+      backing->missing_page = 0x10;
+      break;
+    case 8:
+      backing->alias_page = {0x100, 0x10};
+      break; // Attachment aliases the ring.
+    case 9:
+      state.sh_registers[gfx12 ? 0x89 : 0xc8] = 0x100;
+      break; // Code in the ring.
+    case 10:
+      state.context_registers[gfx12 ? 0x2a6 : 0x2d5] |= 1u << 14;
+      break;
+    case 11:
+      state.context_registers[gfx12 ? 0x2a6 : 0x2d5] |= 1u << 5;
+      break;
+    case 12:
+      state.context_registers[gfx12 ? 0x1b : 0x203] |= 1u << 12;
+      break;
+    case 13:
+      state.context_registers[gfx12 ? 0x1b : 0x203] = 0;
+      break; // Late-Z feedback.
+    }
+    amdgpu::GraphicsDraw draw(state, GetParam(), 1920);
+    EXPECT_EQ(draw.enable_vertex_batching(*access), mode == 0);
+    EXPECT_EQ(draw.vertex_dispatch().total_wgs, mode == 0 ? 32u : 1u);
+  }
+  EXPECT_EQ(faults, 0u);
+  EXPECT_EQ(backing->reads, 0u);
+  EXPECT_EQ(backing->writes, 0u);
+}
+
+TEST_P(GraphicsExportTest, VertexBatchPreservesIndicesInstancesStripsAndPaddedRingSlots) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  auto handle = vm.register_address_space(
+      0, std::make_shared<amdgpu::IdentityAddressSpaceTranslator>(), backing);
+  auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  for (uint32_t wave_size : {32u, 64u})
+    for (uint32_t primitive : {4u, 6u, 17u})
+      for (uint32_t stride : {1u, 31u}) {
+        SCOPED_TRACE(testing::Message() << wave_size << ',' << primitive << ',' << stride);
+        auto state = batch_state(wave_size);
+        state.num_instances = 3;
+        state.uconfig_registers[0x242] = primitive;
+        state.context_registers[0x204] = 1u << 22; // No rasterization.
+        // Maximum stride limits Wave64 to two groups; a smaller stride admits 32.
+        if (gfx12)
+          state.sh_registers[0x31] = stride;
+        else
+          state.context_registers[0x1b1] = stride << 1;
+        const uint32_t slot_bytes = wave_size * (stride + 1) * 16;
+        std::vector<uint32_t> indices(769);
+        for (uint32_t i = 0; i < indices.size(); ++i)
+          indices[i] = 2000 - i;
+        std::vector<uint32_t> expected;
+        uint32_t reference_dispatches = 0;
+        for (bool batched : {false, true}) {
+          amdgpu::GraphicsDraw draw(state, GetParam(), indices.size(), indices);
+          if (batched) {
+            ASSERT_TRUE(draw.enable_vertex_batching(*access));
+          }
+          std::vector<uint32_t> actual;
+          uint32_t dispatches = 0;
+          auto dispatch = std::optional{draw.vertex_dispatch()};
+          while (dispatch) {
+            ++dispatches;
+            EXPECT_FALSE(draw.fragment_stage());
+            if (batched && dispatches == 1) {
+              EXPECT_EQ(dispatch->total_wgs, std::min(32u, 65536u / slot_bytes));
+            }
+            for (uint32_t group = 0; group < dispatch->total_wgs; ++group) {
+              batch_wave(wave_size, group);
+              draw.initialize(*wave_, group, 0);
+              const uint32_t offset = wave_->debug_read_sgpr(5);
+              EXPECT_EQ(offset, batched ? group * slot_bytes / 512 : 0u);
+              EXPECT_LE(offset, 0x7fffu);
+              EXPECT_LE((offset << 9) + slot_bytes, 65536u);
+              EXPECT_EQ(wave_->debug_read_sgpr(3) >> 16, 0u); // One wave per workgroup.
+              const uint32_t count = wave_->debug_read_sgpr(3) & 255;
+              const uint32_t primitives = (wave_->debug_read_sgpr(3) >> 8) & 255;
+              actual.push_back(count);
+              actual.push_back(primitives);
+              for (uint32_t lane = 0; lane < count; ++lane) {
+                actual.push_back(wave_->debug_read_vgpr(gfx12 ? 3 : 5, lane));
+                actual.push_back(wave_->debug_read_vgpr(gfx12 ? 4 : 8, lane));
+                draw.export_lane(*wave_, lane, 12, 15, {0, 0, 0, 0x3f800000});
+              }
+              for (uint32_t lane = 0; lane < primitives; ++lane) {
+                const auto connectivity = wave_->debug_read_vgpr(0, lane);
+                actual.push_back(connectivity);
+                draw.export_lane(*wave_, lane, 20, 1, {connectivity, 0, 0, 0});
+              }
+            }
+            dispatch = draw.advance(*access);
+          }
+          if (batched) {
+            EXPECT_EQ(actual, expected);
+            EXPECT_LT(dispatches, reference_dispatches);
+          } else {
+            expected = std::move(actual);
+            reference_dispatches = dispatches;
+          }
+        }
+        // Different virtual ring pages backed by the same host page decline.
+        backing->alias_page = {0x11, 0x10};
+        amdgpu::GraphicsDraw aliased(state, GetParam(), indices.size(), indices);
+        EXPECT_FALSE(aliased.enable_vertex_batching(*access));
+        backing->alias_page.reset();
+      }
+}
+
+TEST_P(GraphicsExportTest, VertexBatchCapsGroupCountAndAttributeOffsetsForLargestSlots) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  const auto handle = vm.register_address_space(0, backing, backing);
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  auto state = batch_state(64);
+  state.uconfig_registers[0x447] = 15; // One MiB accommodates 32 maximum-stride slots.
+  state.context_registers[gfx12 ? 0x216 : 0x202] = 0;
+  if (gfx12)
+    state.sh_registers[0x31] = 31;
+  else
+    state.context_registers[0x1b1] = 31 << 1;
+  amdgpu::GraphicsDraw draw(state, GetParam(), 4096);
+  ASSERT_TRUE(draw.enable_vertex_batching(*access, UINT32_MAX));
+  ASSERT_EQ(draw.vertex_dispatch().total_wgs, 32u);
+  batch_wave(64, 31);
+  draw.initialize(*wave_, 31, 0);
+  const uint32_t offset = wave_->debug_read_sgpr(5);
+  EXPECT_EQ(offset, 31u * 64u);
+  EXPECT_EQ(offset & ~0x7fffu, 0u);
+  EXPECT_EQ((offset << 9) + 64u * 512u, 1u << 20);
+}
+
+TEST_P(GraphicsExportTest, VertexBatchMatchesSerialHelpersParametersBlendingAndSlotReuse) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  for (uint32_t wave_size : {32u, 64u}) {
+    SCOPED_TRACE(wave_size);
+    std::vector<uint32_t> reference_inputs;
+    std::vector<std::byte> reference_pixels;
+    uint32_t reference_dispatches = 0;
+    for (bool batched : {false, true}) {
+      auto backing = std::make_shared<GraphicsBatchMemory>();
+      amdgpu::GpuVm vm;
+      auto handle = vm.register_address_space(
+          0, std::make_shared<amdgpu::IdentityAddressSpaceTranslator>(), backing);
+      auto access = vm.snapshot(handle);
+      ASSERT_TRUE(access);
+      auto state = batch_state(wave_size);
+      state.num_instances = 2;
+      state.uconfig_registers[0x242] = 4; // Triangles leave helper lanes uncovered.
+      if (gfx12)
+        state.sh_registers[0x31] = 1u << 11;
+      else
+        state.context_registers[0x1b6] |= 1;
+      state.context_registers[gfx12 ? 0x199 : 0x191] = 0x400;     // Flat attribute zero.
+      state.context_registers[0x1e0] = (1u << 30) | 4 | (5 << 8); // Source alpha blending.
+      auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 1200);
+      if (batched) {
+        ASSERT_TRUE(draw->enable_vertex_batching(*access));
+      }
+      std::vector<uint32_t> inputs;
+      uint32_t dispatches = 0;
+      auto dispatch = std::optional{draw->vertex_dispatch()};
+      while (dispatch) {
+        ++dispatches;
+        if (batched && dispatches == 1) {
+          ASSERT_EQ(dispatch->total_wgs, 32u);
+        }
+        for (uint32_t group = 0; group < dispatch->total_wgs; ++group) {
+          batch_wave(dispatch->kernel_wave_size, group);
+          wave_->set_graphics_stage(draw);
+          draw->initialize(*wave_, group, 0);
+          if (!draw->fragment_stage()) {
+            const uint32_t count = wave_->debug_read_sgpr(3) & 255;
+            const uint32_t primitives = (wave_->debug_read_sgpr(3) >> 8) & 255;
+            const uint32_t offset = wave_->debug_read_sgpr(5) << 9;
+            const uint32_t first = wave_->debug_read_vgpr(gfx12 ? 3 : 5, 0);
+            const uint32_t instance = wave_->debug_read_vgpr(gfx12 ? 4 : 8, 0);
+            for (uint32_t lane = 0; lane < ((count + 7) & ~7u); ++lane) {
+              const auto address = amdgpu::addr_calc::rdna_buffer_address(3u << 30, 2u << 21, 16,
+                                                                          true, lane, 0, 0, 0);
+              const std::array<float, 4> attribute{
+                  float(((first + lane) / 3 + instance * 7) % 31) / 32, 0.25f, 0.5f, 0.25f};
+              ASSERT_EQ(access->write(0x10000 + offset + address.offset,
+                                      std::as_bytes(std::span{attribute})),
+                        amdgpu::VmAccessOutcome::Complete);
+              if (lane < count)
+                draw->export_lane(*wave_, lane, 12, 15,
+                                  {std::bit_cast<uint32_t>(lane % 3 == 2 ? 1.0f : -1.0f),
+                                   std::bit_cast<uint32_t>(lane % 3 == 1 ? 1.0f : -1.0f), 0,
+                                   std::bit_cast<uint32_t>(1.0f)});
+            }
+            for (uint32_t lane = 0; lane < primitives; ++lane)
+              draw->export_lane(*wave_, lane, 20, 1, {wave_->debug_read_vgpr(0, lane), 0, 0, 0});
+          } else {
+            inputs.push_back(uint32_t(wave_->exec()));
+            for (uint32_t i = 0; i < 12; ++i)
+              inputs.push_back(lds_.read32(wave_->lds_base() + i * 4));
+            std::array<uint32_t, 4> color;
+            for (uint32_t i = 0; i < 4; ++i)
+              color[i] = lds_.read32(wave_->lds_base() + i * 12);
+            for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane) {
+              for (uint32_t reg = 0; reg < 4; ++reg)
+                inputs.push_back(wave_->debug_read_vgpr(reg, lane));
+              draw->export_lane(*wave_, lane, 0, 15, color);
+            }
+          }
+        }
+        dispatch = draw->advance(*access);
+      }
+      const auto pixels = std::span{backing->bytes}.subspan(0x100000, 1024);
+      EXPECT_FALSE(inputs.empty());
+      EXPECT_TRUE(
+          std::ranges::any_of(pixels, [](std::byte value) { return value != std::byte{0}; }));
+      if (batched) {
+        EXPECT_EQ(inputs, reference_inputs);
+        EXPECT_TRUE(std::ranges::equal(pixels, reference_pixels));
+        EXPECT_LT(dispatches * 3, reference_dispatches);
+      } else {
+        reference_inputs = std::move(inputs);
+        reference_pixels.assign(pixels.begin(), pixels.end());
+        reference_dispatches = dispatches;
+      }
+      EXPECT_FALSE(wave_->instruction_execution_failed());
+    }
+  }
+}
+
+TEST_P(GraphicsExportTest, VertexBatchAttributeFailureUsesOrdinaryVmFaultDelivery) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  std::vector<uint64_t> faults;
+  auto handle = vm.register_address_space(0, backing, backing,
+                                          [&](uint64_t address, amdgpu::VmAccessKind kind) {
+                                            EXPECT_EQ(kind, amdgpu::VmAccessKind::Read);
+                                            faults.push_back(address);
+                                          });
+  auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  auto state = batch_state();
+  if (gfx12)
+    state.sh_registers[0x31] = 31 | (1u << 11);
+  else {
+    state.context_registers[0x1b1] = 31 << 1;
+    state.context_registers[0x1b6] |= 1;
+  }
+  auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 60);
+  ASSERT_TRUE(draw->enable_vertex_batching(*access));
+  ASSERT_EQ(draw->vertex_dispatch().total_wgs, 2u);
+  for (uint32_t group = 0; group < 2; ++group) {
+    batch_wave(32, group);
+    draw->initialize(*wave_, group, 0);
+    for (uint32_t lane = 0; lane < 30; ++lane)
+      draw->export_lane(*wave_, lane, 12, 15,
+                        {std::bit_cast<uint32_t>(lane % 3 == 2 ? 1.0f : -1.0f),
+                         std::bit_cast<uint32_t>(lane % 3 == 1 ? 1.0f : -1.0f), 0, 0x3f800000});
+    for (uint32_t lane = 0; lane < 10; ++lane)
+      draw->export_lane(*wave_, lane, 20, 1, {wave_->debug_read_vgpr(0, lane), 0, 0, 0});
+  }
+  // A later mapping failure is handled at the real access, not by retained host pointers.
+  backing->missing_page = 0x14;
+  EXPECT_THROW(draw->advance(*access), std::runtime_error);
+  EXPECT_EQ(faults, (std::vector<uint64_t>{0x14000}));
+  EXPECT_GT(backing->reads, 1u);
+  EXPECT_EQ(backing->writes, 0u);
+}
+
+TEST_P(GraphicsExportTest, VertexBatchDrainsBoundedFragmentWindowsBeforeReusingSlots) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  const auto handle = vm.register_address_space(0, backing, backing);
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  auto state = batch_state();
+  auto &ctx = state.context_registers;
+  ctx[gfx12 ? 0x216 : 0x202] = 0; // No attachment IO: exercise scheduling and coverage.
+  ctx[0x10f] = ctx[0x110] = ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(32.0f);
+  ctx[0x91] = (64 - gfx12) | ((64 - gfx12) << 16);
+  amdgpu::GraphicsDraw draw(state, GetParam(), 1050);
+  ASSERT_TRUE(draw.enable_vertex_batching(*access));
+  uint32_t vertex_dispatches = 0, fragment_dispatches = 0, waves = 0;
+  auto dispatch = std::optional{draw.vertex_dispatch()};
+  while (dispatch) {
+    if (!draw.fragment_stage()) {
+      ++vertex_dispatches;
+      ASSERT_EQ(dispatch->total_wgs, vertex_dispatches == 1 ? 32u : 3u);
+      EXPECT_EQ(fragment_dispatches, vertex_dispatches == 1 ? 0u : 8u);
+      for (uint32_t group = 0; group < dispatch->total_wgs; ++group) {
+        batch_wave(32, group);
+        draw.initialize(*wave_, group, 0);
+        EXPECT_EQ(wave_->debug_read_sgpr(5), group);
+        for (uint32_t lane = 0; lane < 30; ++lane)
+          draw.export_lane(*wave_, lane, 12, 15,
+                           {std::bit_cast<uint32_t>(lane % 3 == 2 ? 1.0f : -1.0f),
+                            std::bit_cast<uint32_t>(lane % 3 == 1 ? 1.0f : -1.0f), 0, 0x3f800000});
+        for (uint32_t lane = 0; lane < 10; ++lane)
+          draw.export_lane(*wave_, lane, 20, 1, {wave_->debug_read_vgpr(0, lane), 0, 0, 0});
+      }
+    } else {
+      ++fragment_dispatches;
+      waves += dispatch->total_wgs;
+      EXPECT_LE(dispatch->total_wgs, 4096u + 1280u);
+      // No output or side effect is enabled; an empty FS need not export a value.
+    }
+    dispatch = draw.advance(*access);
+  }
+  EXPECT_EQ(vertex_dispatches, 2u);
+  EXPECT_EQ(fragment_dispatches, 9u);
+  EXPECT_EQ(waves, 350u * 4096u / 32u);
+  EXPECT_EQ(backing->writes, 0u);
+}
+
 TEST_P(GraphicsExportTest, TriangleAndRectangleListsKeepTrailingVerticesWithoutCreatingPrimitives) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
   for (uint32_t primitive : {4u, 17u})
@@ -1699,6 +3735,86 @@ TEST(GraphicsImageAddressTest, MatchesGfx11AddrLibWithPipeXorAndAlignedLinearPit
   EXPECT_FALSE(amdgpu::gfx11_image_offset(0, 0, 64, 4, 18));
   EXPECT_FALSE(amdgpu::gfx11_image_offset(0, 0, 64, 16, 24));
   EXPECT_FALSE(amdgpu::gfx11_image_offset(64, 0, 64, 4, 26));
+}
+
+TEST(GraphicsImageAddressTest, TiledEquationsMatchAddrLibAcrossTexelSizes) {
+  // Mesa 25.2.8 AddrLib, GFX11 GB_ADDR_CONFIG=0x545 and GFX12, single-level 2D.
+  // Each digest covers both dimensions below, the individual coordinate bits,
+  // mixed coordinates, and the final pixel. Expected values come from AddrLib's
+  // surface-address API, independently of the simulator's equation tables.
+  struct Case {
+    bool gfx12;
+    uint32_t swizzle, bytes;
+    uint64_t digest;
+  };
+  constexpr Case cases[] = {
+      {false, 0, 1, 0x8d238fdaa38a0f09ull},   {false, 0, 2, 0x4b7e6185845bcd6dull},
+      {false, 0, 4, 0xdbaedd5aa75497d5ull},   {false, 0, 8, 0x9343fb18ec5e8625ull},
+      {false, 0, 16, 0xae97d2316c06bca5ull},  {false, 2, 1, 0x1eb5d01f12181f8dull},
+      {false, 2, 2, 0x507cc28382b86cc5ull},   {false, 2, 4, 0x849c773adccced05ull},
+      {false, 2, 8, 0x4f052becc8c873e5ull},   {false, 2, 16, 0xf0ff5085f0b855e5ull},
+      {false, 6, 1, 0x524cea743a8d538dull},   {false, 6, 2, 0x0b8a11ac88d17ec5ull},
+      {false, 6, 4, 0x3bdd40ffdcf75905ull},   {false, 6, 8, 0x5d3faf0fd5c17de5ull},
+      {false, 6, 16, 0x59772612ddf16ce5ull},  {false, 10, 1, 0x5e8fe8e48384738dull},
+      {false, 10, 2, 0x4ee5b8ce3c041ec5ull},  {false, 10, 4, 0x5e3b78a302d63905ull},
+      {false, 10, 8, 0x109cfdbb9ce95de5ull},  {false, 10, 16, 0xc0db1fd1c5c8ece5ull},
+      {false, 22, 1, 0x8a78728e37e5f28dull},  {false, 22, 2, 0xbbbf962d26c3e9c5ull},
+      {false, 22, 4, 0xeaafbee485d9c805ull},  {false, 22, 8, 0x5197669050ef92e5ull},
+      {false, 22, 16, 0xac24dbd8673ab6e5ull}, {false, 24, 1, 0xca319fb842fd1e8dull},
+      {false, 24, 2, 0x97ae25ba9eb2adc5ull},  {false, 24, 4, 0x452aa64d03101205ull},
+      {false, 24, 8, 0x68b27d70a5e83ce5ull},  {false, 26, 1, 0x4e294f3dd837808dull},
+      {false, 26, 2, 0xdcd27134ae6b03c5ull},  {false, 26, 4, 0x06f82e39ddc9a405ull},
+      {false, 26, 8, 0x456b3eef3ee302e5ull},  {false, 26, 16, 0xe01edf2a729f07e5ull},
+      {false, 27, 1, 0xca319fb842fd1e8dull},  {false, 27, 2, 0x97ae25ba9eb2adc5ull},
+      {false, 27, 4, 0x452aa64d03101205ull},  {false, 27, 8, 0x68b27d70a5e83ce5ull},
+      {false, 27, 16, 0xfe0c8c305c13a1e5ull}, {false, 28, 1, 0xdcc8a89c1fdb9e8dull},
+      {false, 28, 2, 0xdf9a13dea1862dc5ull},  {false, 28, 4, 0x5805defdea8e9205ull},
+      {false, 28, 8, 0x0f39b3e80a0b7ce5ull},  {false, 30, 1, 0x75412891181c808dull},
+      {false, 30, 2, 0x0fb06a1f0dcd03c5ull},  {false, 30, 4, 0xdf695bb409bfa405ull},
+      {false, 30, 8, 0xcea90862c4cf02e5ull},  {false, 30, 16, 0xb661ad45b32f07e5ull},
+      {false, 31, 1, 0xdcc8a89c1fdb9e8dull},  {false, 31, 2, 0xdf9a13dea1862dc5ull},
+      {false, 31, 4, 0x5805defdea8e9205ull},  {false, 31, 8, 0x0f39b3e80a0b7ce5ull},
+      {false, 31, 16, 0x393179573ac1e1e5ull}, {true, 0, 1, 0x8d238fdaa38a0f09ull},
+      {true, 0, 2, 0x7761ac6476a2a1edull},    {true, 0, 4, 0xdbaedd5aa75497d5ull},
+      {true, 0, 8, 0xf970a2b6d5f302a5ull},    {true, 0, 16, 0x081ea84c7988fc25ull},
+      {true, 1, 1, 0x1eb5d01f12181f8dull},    {true, 1, 2, 0x507cc28382b86cc5ull},
+      {true, 1, 4, 0x849c773adccced05ull},    {true, 1, 8, 0x4f052becc8c873e5ull},
+      {true, 1, 16, 0xf0ff5085f0b855e5ull},   {true, 2, 1, 0x524cea743a8d538dull},
+      {true, 2, 2, 0x0b8a11ac88d17ec5ull},    {true, 2, 4, 0x3bdd40ffdcf75905ull},
+      {true, 2, 8, 0x5d3faf0fd5c17de5ull},    {true, 2, 16, 0x59772612ddf16ce5ull},
+      {true, 3, 1, 0x5e8fe8e48384738dull},    {true, 3, 2, 0x4ee5b8ce3c041ec5ull},
+      {true, 3, 4, 0x5e3b78a302d63905ull},    {true, 3, 8, 0x109cfdbb9ce95de5ull},
+      {true, 3, 16, 0xc0db1fd1c5c8ece5ull},   {true, 4, 1, 0x7606f62441cd738dull},
+      {true, 4, 2, 0x6272319766441ec5ull},    {true, 4, 4, 0xe36a8ae2078c3905ull},
+      {true, 4, 8, 0x1404f02b7a895de5ull},    {true, 4, 16, 0x79cd39a75428ece5ull},
+  };
+  for (const auto &c : cases) {
+    SCOPED_TRACE(testing::Message() << c.gfx12 << ',' << c.swizzle << ',' << c.bytes);
+    const auto address = c.gfx12 ? amdgpu::gfx12_image_offset : amdgpu::gfx11_image_offset;
+    uint64_t digest = 0xcbf29ce484222325ull;
+    for (uint32_t width : {420u, 4096u}) {
+      const uint32_t height = width == 420 ? 320 : 4096;
+      for (uint32_t sample = 0; sample < 64; ++sample) {
+        uint32_t x = 0, y = 0;
+        if (sample < 12)
+          x = (1u << sample) % width;
+        else if (sample < 24)
+          y = (1u << (sample - 12)) % height;
+        else {
+          x = (sample * 1387) % width;
+          y = (sample * 2477) % height;
+        }
+        if (sample == 63) {
+          x = width - 1;
+          y = height - 1;
+        }
+        const auto offset = address(x, y, width, c.bytes, c.swizzle);
+        ASSERT_TRUE(offset);
+        digest = (digest ^ *offset) * 0x100000001b3ull;
+      }
+    }
+    EXPECT_EQ(digest, c.digest);
+  }
 }
 
 TEST(GraphicsImageAddressTest, MipAddressesMatchAddrLibAtOddSizesAndTailTransitions) {
@@ -5495,6 +7611,97 @@ TEST_P(GraphicsExportTest, InterpolationSnapshotsQuadSourcesWhenDestinationAlias
   }
 }
 
+TEST_P(GraphicsExportTest, InterpolationPreservesHostEnvironmentForRegisterObservers) {
+  class Observer final : public ExecutionPlugin {
+  public:
+    Observer() : ExecutionPlugin("interpolation_environment") {}
+    using State = std::array<uint32_t, 3>;
+    static State capture() {
+      State state{uint32_t(std::fegetround()), uint32_t(std::fetestexcept(FE_ALL_EXCEPT)), 0};
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+      state[2] = _mm_getcsr();
+#endif
+      return state;
+    }
+    void onAmdgpuReadVgprLanes(const amdgpu::Wavefront *, uint32_t, uint64_t, uint8_t) override {
+      states.push_back(capture());
+      ++reads;
+    }
+    void onAmdgpuWriteVgprLanes(const amdgpu::Wavefront *, uint32_t, uint64_t, uint8_t) override {
+      states.push_back(capture());
+      ++writes;
+    }
+    std::vector<State> states;
+    uint32_t reads = 0, writes = 0;
+  };
+  auto group = std::make_shared<ExecutionPluginGroup>(PluginSinkConfig{});
+  auto observer = std::make_unique<Observer>();
+  auto *recorded = observer.get();
+  group->add(std::move(observer));
+  cu_->set_plugin_group(group);
+  struct Case {
+    uint32_t a, b, c, mode, expected;
+    bool clamp = false;
+  };
+  const Case cases[] = {
+      // Midpoint rounding follows guest MODE even with hostile host rounding.
+      {0x3f800000, 0x33800000, 0x3f800000, 0x30, 0x3f800000},
+      {0x3f800000, 0x33800000, 0x3f800000, 0x31, 0x3f800001},
+      {0xbf800000, 0x33800000, 0xbf800000, 0x32, 0xbf800001},
+      {0xbf800000, 0x33800000, 0xbf800000, 0x33, 0xbf800000},
+      // Input and output flushing are independent of host DAZ/FTZ.
+      {0x3f800000, 0x00000001, 0x00000000, 0x30, 0x00000001},
+      {0x3f800000, 0x00000001, 0x00000000, 0x20, 0x00000000},
+      {0x00800000, 0x3f000000, 0x00000000, 0x10, 0x00000000},
+      // Tiny rounding to minimum normal exercises the nested precision guard.
+      {0x00800000, 0x3f7fffff, 0x00000000, 0x00, 0x00000000},
+      {0x00800000, 0x3f7fffff, 0x00000000, 0x30, 0x00800000},
+      {0x00800000, 0x3f7fffff, 0x00000000, 0x32, 0x007fffff},
+      {0x7f801234, 0x3f800000, 0x00000000, 0x30, 0x7f801234},
+      {0x00000000, 0x7f800000, 0x00000000, 0x30, 0xffc00000},
+      {0x7f801234, 0x3f800000, 0x00000000, 0x30, 0x00000000, true},
+      {0x3f800000, 0x33800000, 0x3f800000, 0x31, 0x3f800000, true},
+  };
+  for (bool second : {false, true})
+    for (bool ieee : {false, true})
+      for (const auto &test : cases) {
+        SCOPED_TRACE(testing::Message() << second << ',' << ieee << ',' << test.mode << ','
+                                        << test.a << ',' << test.b << ',' << test.c);
+        wave_->set_exec(0xfd); // Inactive lane one still supplies the quad coefficient.
+        wave_->set_mode_raw(test.mode | (uint32_t(ieee) << 9));
+        for (uint32_t lane = 0; lane < 8; ++lane) {
+          wave_->debug_write_vgpr(0, lane, test.a);
+          wave_->debug_write_vgpr(1, lane, test.b);
+          wave_->debug_write_vgpr(2, lane, test.c);
+        }
+        recorded->states.clear();
+        recorded->reads = recorded->writes = 0;
+        Observer::State before, after;
+        {
+          amdgpu::fp_mode::ScopedEnvironment restore_host(0);
+          std::fesetround(FE_UPWARD);
+          std::feraiseexcept(FE_DIVBYZERO);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
+          // Preserve sticky flags and an enabled invalid-operation trap as well.
+          _mm_setcsr((_mm_getcsr() | (1u << 6) | (1u << 15)) & ~(1u << 7));
+#endif
+          before = Observer::capture();
+          amdgpu::execute_graphics_interp_f32(*wave_, 0, {0, 1, 2}, second, 0, test.clamp, 0);
+          after = Observer::capture();
+        }
+        EXPECT_EQ(after, before);
+        ASSERT_EQ(recorded->reads, 21u);
+        ASSERT_EQ(recorded->writes, 7u);
+        for (const auto &state : recorded->states)
+          EXPECT_EQ(state, before);
+        uint32_t expected = test.expected;
+        if (expected == 0x7f801234 && (ieee || GetParam() == ROCJITSU_CODE_ARCH_RDNA4))
+          expected |= 0x00400000;
+        for (uint32_t lane = 0; lane < 8; ++lane)
+          EXPECT_EQ(wave_->debug_read_vgpr(0, lane), lane == 1 ? test.a : expected) << lane;
+      }
+}
+
 TEST_P(GraphicsExportTest, PreservesBitsAndSelectsActiveLanesAndComponents) {
   wave_->set_exec(uint64_t{1} | (uint64_t{1} << 31));
   wave_->debug_write_vgpr(3, 0, 0x7fc12345);
@@ -5539,6 +7746,52 @@ TEST_P(GraphicsExportTest, SkipExportAndEmptyExecDoNotAccessSources) {
   wave_->set_exec(0);
   execute(12, 15, true);
   EXPECT_FALSE(wave_->instruction_execution_failed());
+}
+
+TEST_P(GraphicsExportTest, ExpandedHtileProbeRequiresCallerOptInAndQualifiedBacking) {
+  if (GetParam() == ROCJITSU_CODE_ARCH_RDNA4)
+    GTEST_SKIP();
+  for (uint32_t variant = 0; variant < 3; ++variant) {
+    SCOPED_TRACE(variant);
+    constexpr uint32_t width = 16, height = 8;
+    constexpr uint64_t metadata = 0x100000, depth = 0x200000;
+    auto backing = std::make_shared<GraphicsBatchMemory>();
+    amdgpu::GpuVm vm;
+    const auto handle = vm.register_address_space(7, backing, backing);
+    const auto access = vm.snapshot(handle);
+    ASSERT_TRUE(access);
+    const uint32_t bytes = variant == 2 ? 2 : 4;
+    for (uint32_t x = 0; x < width; x += 8) {
+      const auto address =
+          *amdgpu::gfx11_metadata_address(metadata, x, 0, width, height, bytes, 24, true);
+      const uint32_t key = 0xfffc000f;
+      std::memcpy(backing->bytes.data() + address, &key, sizeof(key));
+    }
+    auto state = rectangle_state();
+    auto &ctx = state.context_registers;
+    ctx[0x200] = 2 | (7 << 4);
+    ctx[7] = (width - 1) | ((height - 1) << 16);
+    ctx[0x10] = (bytes == 4 ? 3 : 1) | (24 << 4) | (1u << 29);
+    ctx[0x12] = ctx[0x14] = depth >> 8;
+    ctx[0x2af] = 1u << 18;
+    ctx[5] = metadata >> 8;
+    ctx[0x10f] = ctx[0x110] = std::bit_cast<uint32_t>(width / 2.0f);
+    ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(height / 2.0f);
+    ctx[0xb5] = std::bit_cast<uint32_t>(1.0f);
+    ctx[0x91] = width | (height << 16);
+    amdgpu::GraphicsDraw draw(state, GetParam(), 3);
+    export_rectangle_vertices(draw);
+    // The default is the caller's observer/debug path. Even when opted in,
+    // this custom translator refuses the lease and retains its ordinary reads.
+    if (variant == 0) {
+      EXPECT_TRUE(draw.advance(*access));
+    } else {
+      EXPECT_TRUE(draw.advance(*access, nullptr, 1, true));
+    }
+    EXPECT_EQ(backing->ram_lease_requests, variant == 1 ? 1u : 0u);
+    EXPECT_EQ(backing->reads, 2u);
+    EXPECT_EQ(backing->writes, 0u);
+  }
 }
 
 TEST_P(GraphicsExportTest, MetadataAttachmentsPreserveDrawsAndRejectedState) {
@@ -5791,6 +8044,218 @@ TEST(GraphicsImageMetadataTest, LayerDccClearPreservesOtherLayers) {
   EXPECT_EQ(memory.read32(0x440200), 0x12345678u);
   EXPECT_EQ(memory.read32(0x10c600), 0xffu);
   EXPECT_EQ(memory.read32(0x108200), 2u);
+}
+
+namespace {
+
+// Exercise the real compatibility translator and sealed-RAM admission. Raw PTE
+// edits below deliberately cover states that KfdProcess normally normalizes.
+struct ExpandedHtileFixture {
+  static constexpr uint64_t metadata_base = 0x100000, depth_base = 0x200000;
+  static constexpr auto sealed = amdgpu::LegacyHostExtentOwner::DriverSealedRam;
+  struct Reporter final : amdgpu::MemoryFaultReporter {
+    std::vector<uint64_t> addresses;
+    void report_memory_fault(uint32_t, uint64_t address, amdgpu::MemoryFaultCause) override {
+      addresses.push_back(address);
+    }
+  } reporter;
+  amdgpu::GpuMemory memory{"expanded_htile"};
+  KfdProcess process{7};
+  std::vector<uint8_t> metadata = std::vector<uint8_t>(131072, 0x5a);
+  std::vector<uint8_t> depth = std::vector<uint8_t>(262144, 0x5a);
+  amdgpu::GpuVm vm;
+  amdgpu::LegacyGpuVmAdapter adapter{vm, &memory};
+  std::optional<amdgpu::GpuVmAccess> access;
+  uint32_t width, height, swizzle;
+
+  ExpandedHtileFixture(uint32_t width = 16, uint32_t height = 8, uint32_t swizzle = 24)
+      : width(width), height(height), swizzle(swizzle) {
+    process.map_pages(metadata_base, metadata.data(), metadata.size(), amdgpu::Mtype::RW, sealed);
+    process.map_pages(depth_base, depth.data(), depth.size(), amdgpu::Mtype::RW, sealed);
+    const auto handle = adapter.register_address_space(
+        7, {.page_table = &process.page_table_,
+            .page_table_mutex = &process.page_table_mutex_,
+            .page_table_generation = process.page_table_generation(),
+            .request_mutex = process.page_table_request_mutex(),
+            .mutation_epoch = process.page_table_mutation_epoch(),
+            .page_table_cache_state = process.page_table_cache_state(),
+            .fault_reporter = &reporter});
+    access = vm.snapshot(handle);
+    for (uint32_t y = 0; y < height; y += 8)
+      for (uint32_t x = 0; x < width; x += 8)
+        set_key(x, y, 0xfffc000f);
+  }
+  uint64_t key_address(uint32_t x, uint32_t y) const {
+    return *amdgpu::gfx11_metadata_address(metadata_base, x, y, width, height, 4, swizzle, true);
+  }
+  void set_key(uint32_t x, uint32_t y, uint32_t value) {
+    std::memcpy(metadata.data() + key_address(x, y) - metadata_base, &value, sizeof(value));
+  }
+  uint32_t key(uint32_t x, uint32_t y) const {
+    uint32_t value;
+    std::memcpy(&value, metadata.data() + key_address(x, y) - metadata_base, sizeof(value));
+    return value;
+  }
+  bool probe() const {
+    return amdgpu::try_gfx11_expanded_htile(*access, metadata_base, width, height, swizzle);
+  }
+  void materialize(bool probe_first, uint32_t clear = 0x3f000000) const {
+    if (probe_first && probe())
+      return;
+    for (uint32_t y = 0; y < height; y += 8)
+      for (uint32_t x = 0; x < width; x += 8)
+        amdgpu::materialize_gfx11_htile(*access, depth_base, metadata_base, x, y, width, height, 4,
+                                        swizzle, clear);
+  }
+};
+
+} // namespace
+
+TEST(GraphicsImageMetadataTest, ExpandedHtileProbeUsesFreshLegacyRamAndPreservesHostState) {
+  std::fenv_t saved;
+  ASSERT_EQ(std::fegetenv(&saved), 0);
+  const int saved_errno = errno;
+  struct Restore {
+    std::fenv_t &saved;
+    int error;
+    ~Restore() {
+      std::fesetenv(&saved);
+      errno = error;
+    }
+  } restore{saved, saved_errno};
+  for (uint32_t swizzle : {24u, 28u}) {
+    ExpandedHtileFixture fixture(320, 240, swizzle);
+    ASSERT_TRUE(fixture.access);
+    const auto metadata = fixture.metadata, depth = fixture.depth;
+    for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+      ASSERT_EQ(std::fesetround(mode), 0);
+      ASSERT_EQ(std::feclearexcept(FE_ALL_EXCEPT), 0);
+      ASSERT_EQ(std::feraiseexcept(FE_INVALID | FE_DIVBYZERO), 0);
+      errno = EDOM;
+      const bool expanded = fixture.probe();
+      const int observed_errno = errno, flags = std::fetestexcept(FE_ALL_EXCEPT);
+      EXPECT_TRUE(expanded);
+      EXPECT_EQ(observed_errno, EDOM);
+      EXPECT_EQ(flags, FE_INVALID | FE_DIVBYZERO);
+      EXPECT_EQ(std::fegetround(), mode);
+    }
+    EXPECT_EQ(fixture.metadata, metadata);
+    EXPECT_EQ(fixture.depth, depth);
+    EXPECT_TRUE(fixture.reporter.addresses.empty());
+    const auto generation = *fixture.process.page_table_generation();
+    fixture.set_key(8, 8, 0);
+    EXPECT_FALSE(fixture.probe());
+    EXPECT_EQ(*fixture.process.page_table_generation(), generation);
+    fixture.materialize(true);
+    EXPECT_EQ(fixture.key(8, 8), 0xfffc000fu);
+    EXPECT_TRUE(fixture.probe());
+    // Expanded metadata never needs a valid depth-pixel mapping.
+    fixture.process.unmap_pages(fixture.depth_base, fixture.depth.size());
+    EXPECT_TRUE(fixture.probe());
+    EXPECT_NO_THROW(fixture.materialize(false));
+  }
+}
+
+TEST(GraphicsImageMetadataTest, ExpandedHtileProbePreservesEveryNonExpandedKeyFallback) {
+  for (uint32_t low = 0; low < 15; ++low) {
+    for (uint32_t x : {0u, 8u, 16u}) {
+      SCOPED_TRACE(testing::Message() << low << ',' << x);
+      ExpandedHtileFixture original(24), probed(24);
+      ASSERT_TRUE(original.access && probed.access);
+      for (auto *fixture : {&original, &probed}) {
+        fixture->set_key(0, 0, 0); // A completed clear precedes later failures.
+        fixture->set_key(x, 0, 0x55555550 | low);
+      }
+      const auto before = probed.metadata;
+      EXPECT_FALSE(probed.probe());
+      EXPECT_EQ(probed.metadata, before);
+      EXPECT_TRUE(probed.reporter.addresses.empty());
+      if (low) {
+        EXPECT_THROW(original.materialize(false), std::runtime_error);
+        EXPECT_THROW(probed.materialize(true), std::runtime_error);
+      } else {
+        EXPECT_NO_THROW(original.materialize(false));
+        EXPECT_NO_THROW(probed.materialize(true));
+      }
+      EXPECT_EQ(probed.metadata, original.metadata);
+      EXPECT_EQ(probed.depth, original.depth);
+      EXPECT_EQ(probed.reporter.addresses, original.reporter.addresses);
+    }
+  }
+}
+
+TEST(GraphicsImageMetadataTest, ExpandedHtileProbePreservesFaultAndAliasedStorePrefixes) {
+  for (uint32_t variant = 0; variant < 3; ++variant) {
+    SCOPED_TRACE(variant);
+    ExpandedHtileFixture original, probed;
+    ASSERT_TRUE(original.access && probed.access);
+    for (auto *fixture : {&original, &probed}) {
+      fixture->set_key(0, 0, 0);
+      if (variant == 0) {
+        // A later metadata word faults only after the first clear is published.
+        fixture->process.unmap_pages(fixture->metadata_base, fixture->metadata.size());
+        fixture->process.map_pages(fixture->metadata_base, fixture->metadata.data(), 4,
+                                   amdgpu::Mtype::RW, fixture->sealed);
+      } else if (variant == 1) {
+        // One depth pixel succeeds; the next DWORD crosses a strict subextent.
+        fixture->process.unmap_pages(fixture->depth_base, fixture->depth.size());
+        fixture->process.map_pages(fixture->depth_base, fixture->depth.data(), 6, amdgpu::Mtype::RW,
+                                   fixture->sealed);
+      } else {
+        // The first block's clear changes a later key from unsupported to
+        // expanded. Replaying keys gathered before those stores would throw.
+        fixture->set_key(8, 0, 1);
+        fixture->process.map_pages(fixture->depth_base, fixture->metadata.data(),
+                                   fixture->metadata.size(), amdgpu::Mtype::RW, fixture->sealed);
+      }
+    }
+    EXPECT_FALSE(probed.probe());
+    EXPECT_TRUE(probed.reporter.addresses.empty());
+    if (variant < 2) {
+      EXPECT_THROW(original.materialize(false), std::runtime_error);
+      EXPECT_THROW(probed.materialize(true), std::runtime_error);
+      EXPECT_FALSE(original.reporter.addresses.empty());
+      EXPECT_EQ(original.key(0, 0), variant == 0 ? 0xfffc000fu : 0u);
+    } else {
+      EXPECT_NO_THROW(original.materialize(false, 0x3f80000f));
+      EXPECT_NO_THROW(probed.materialize(true, 0x3f80000f));
+      EXPECT_EQ(original.key(8, 0), 0x3f80000fu);
+    }
+    EXPECT_EQ(probed.metadata, original.metadata);
+    EXPECT_EQ(probed.depth, original.depth);
+    EXPECT_EQ(probed.reporter.addresses, original.reporter.addresses);
+  }
+}
+
+TEST(GraphicsImageMetadataTest, ExpandedHtileProbeDeclinesFragmentedAndUnqualifiedBacking) {
+  for (uint32_t variant = 0; variant < 5; ++variant) {
+    SCOPED_TRACE(variant);
+    ExpandedHtileFixture fixture;
+    ASSERT_TRUE(fixture.access);
+    auto &pte = fixture.process.page_table_.at(fixture.metadata_base >> KfdProcess::kPageShift);
+    if (variant == 0) {
+      pte.host_extents = {{fixture.metadata.data(), 2, 0, fixture.sealed},
+                          {fixture.metadata.data() + 2, 4094, 2, fixture.sealed}};
+    } else if (variant == 1) {
+      pte.host_extents.push_back({fixture.metadata.data() + 4, 4, 4, fixture.sealed});
+    } else if (variant == 2) {
+      pte.host_extents.front().host_backed_bytes = 6;
+    } else {
+      pte.host_extents.front().owner = variant == 3 ? amdgpu::LegacyHostExtentOwner::Driver
+                                                    : amdgpu::LegacyHostExtentOwner::Application;
+    }
+    const auto before = fixture.metadata;
+    EXPECT_FALSE(fixture.probe());
+    EXPECT_TRUE(fixture.reporter.addresses.empty());
+    EXPECT_EQ(fixture.metadata, before);
+    if (variant < 3) {
+      EXPECT_THROW(fixture.materialize(true), std::runtime_error);
+      EXPECT_FALSE(fixture.reporter.addresses.empty());
+    } else {
+      EXPECT_NO_THROW(fixture.materialize(true));
+    }
+    EXPECT_EQ(fixture.metadata, before);
+  }
 }
 
 TEST(GraphicsImageMetadataTest, HtileEndpointClearsAndExplicitClearRegister) {
