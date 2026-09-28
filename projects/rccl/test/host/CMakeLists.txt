@@ -418,6 +418,7 @@ if(BUILD_TESTS)
     fakes/rccl_wrap_fakes.cc             # src/rccl_wrap.cc
     fakes/recorder_fakes.cc              # src/recorder.cc
     fakes/rocmwrap_fakes.cc              # src/misc/rocmwrap.cc
+    $<$<BOOL:${ENABLE_ROCSHMEM}>:fakes/rocshmem_fakes.cc>  # the rocSHMEM host API
     fakes/strongstream_stubs.cc          # src/misc/strongstream.cc
     fakes/sym_kernels_fakes.cc            # src/sym_kernels.cc
     fakes/tuning_fakes.cc                # src/graph/tuning.cc
@@ -1383,6 +1384,13 @@ set(TEST_MICRO_INIT_SOURCE_FILES
   ${RCCL_TEST_DIR}/common/main_altrsmi.cpp
   ${RCCL_TEST_DIR}/common/ProcessIsolatedTestRunner.cpp
 )
+
+# Conditional, unlike the rest: rocshmem_fakes.cc includes rocshmem.hpp, which
+# is only on the include path under ENABLE_ROCSHMEM, and the symbols it defines
+# are only referenced from init.cc's ENABLE_ROCSHMEM arm.
+if(ENABLE_ROCSHMEM)
+  list(APPEND TEST_MICRO_INIT_SOURCE_FILES fakes/rocshmem_fakes.cc)
+endif()
 
 # Three binaries, not one: init.cc gates HIP_HOST_UNCACHED_MEMORY/
 # HIP_UNCACHED_MEMORY and, separately, ENABLE_FAULT_INJECTION at the preprocessor,
