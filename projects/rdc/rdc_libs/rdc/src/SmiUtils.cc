@@ -247,5 +247,27 @@ amdsmi_status_t get_num_partition(uint32_t index, uint16_t* num_partition) {
   return ret;
 }
 
+amdsmi_status_t is_virtualized_gpu(uint32_t index, bool* is_virtualized) {
+  if (is_virtualized == nullptr) {
+    return AMDSMI_STATUS_INVAL;
+  }
+
+  amdsmi_processor_handle proc_handle = nullptr;
+  amdsmi_status_t ret = get_processor_handle_from_id(index, &proc_handle);
+  if (ret != AMDSMI_STATUS_SUCCESS) {
+    return ret;
+  }
+
+  amdsmi_virtualization_mode_t mode = AMDSMI_VIRTUALIZATION_MODE_UNKNOWN;
+  ret = amdsmi_get_gpu_virtualization_mode(proc_handle, &mode);
+  if (ret != AMDSMI_STATUS_SUCCESS) {
+    return ret;
+  }
+
+  *is_virtualized = (mode == AMDSMI_VIRTUALIZATION_MODE_GUEST);
+
+  return AMDSMI_STATUS_SUCCESS;
+}
+
 }  // namespace rdc
 }  // namespace amd
