@@ -35,7 +35,7 @@
 #include "library/rocprofiler-sdk/domain_selection.hpp"
 #include "library/rocprofiler-sdk/domain_service.hpp"
 #include "library/rocprofiler-sdk/fwd.hpp"
-#include "library/rocprofiler-sdk/rccl.hpp"
+// #include "library/rocprofiler-sdk/rccl.hpp"
 #include "library/thread_info.hpp"
 #include "library/tracing.hpp"
 #include "rocprofiler-sdk.hpp"
@@ -89,6 +89,7 @@
 #include <cassert>
 #include <cctype>
 #include <cstdint>
+#include <dlfcn.h>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -305,6 +306,48 @@ struct external_dependencies
         trace_cache::get_buffer_storage().store(sample);
     }
 
+    // ─── Members required by domains::callback::k_rccl ──────────────────────────────
+    using rocm_rccl_api_category = category::rocm_rccl_api;
+    using pmc_event_with_sample  = trace_cache::pmc_event_with_sample;
+    using metadata_registry_t    = trace_cache::metadata_registry;
+    using buffer_storage_t       = trace_cache::buffer_storage_t;
+
+    // NOLINTNEXTLINE(readability-identifier-naming)
+    static constexpr std::string_view rocm_rccl_api_category_name =
+        trait::name<category::rocm_rccl_api>::value;
+
+    // Single source of truth for these strings is core/categories.hpp's
+    // trait::name<category::comm_data>; rccl.hpp itself never includes
+    // categories.hpp, so the values are surfaced here instead.
+    static constexpr std::string_view comm_data_name =
+        trait::name<category::comm_data>::value;
+    static constexpr std::string_view comm_data_description =
+        trait::name<category::comm_data>::description;
+    static constexpr std::size_t comm_data_enum_value =
+        static_cast<std::size_t>(category_enum_id<category::comm_data>::value);
+
+    static constexpr std::string_view rccl_send_label      = "RCCL Comm Send";
+    static constexpr std::string_view rccl_recv_label      = "RCCL Comm Recv";
+    static constexpr std::string_view rccl_send_track_name = rccl_send_label;
+    static constexpr std::string_view rccl_recv_track_name = rccl_recv_label;
+
+    static metadata_registry_t& get_metadata_registry()
+    {
+        return trace_cache::get_metadata_registry();
+    }
+
+    static buffer_storage_t& get_buffer_storage()
+    {
+        return trace_cache::get_buffer_storage();
+    }
+
+    static void* dlsym(const char* symbol_name)
+    {
+        return ::dlsym(RTLD_DEFAULT, symbol_name);
+    }
+
+    static const char* dlerror() { return ::dlerror(); }
+
     static bool check_backtrace_operations(rocprofiler_callback_tracing_kind_t kind,
                                            rocprofiler_tracing_operation_t     operation)
     {
@@ -360,6 +403,8 @@ struct external_dependencies
     {
         return get_backtrace(bt_data);
     }
+
+    using state_thread = state::thread;
 
     // Single source of truth is core/trace_cache/cacheable.hpp's ABSOLUTE constant;
     // kfd_events.hpp never includes that header, so the value is surfaced here.
@@ -1618,12 +1663,13 @@ tool_tracing_callback(rocprofiler_callback_tracing_record_t record,
                 break;
             }
 #endif
-            case ROCPROFILER_CALLBACK_TRACING_RCCL_API:
-            {
-                tool_tracing_callback_start(category::rocm_rccl_api{}, record, user_data,
-                                            ts);
-                break;
-            }
+            // case ROCPROFILER_CALLBACK_TRACING_RCCL_API:
+            // {
+            //     tool_tracing_callback_start(category::rocm_rccl_api{}, record,
+            //     user_data,
+            //                                 ts);
+            //     break;
+            // }
             // MARKER_CORE_API is handled by roctx_client on control_ctx
             case ROCPROFILER_CALLBACK_TRACING_NONE:
             case ROCPROFILER_CALLBACK_TRACING_LAST:
@@ -1677,17 +1723,18 @@ tool_tracing_callback(rocprofiler_callback_tracing_record_t record,
                 break;
             }
 #endif
-            case ROCPROFILER_CALLBACK_TRACING_RCCL_API:
-            {
-                auto* rccl_payload =
-                    static_cast<rocprofiler_callback_tracing_rccl_api_data_t*>(
-                        record.payload);
-                tool_tracing_callback_rccl(record.operation, rccl_payload,
-                                           user_data->value, ts);
-                tool_tracing_callback_stop(category::rocm_rccl_api{}, record, user_data,
-                                           ts, _bt_data);
-                break;
-            }
+            // case ROCPROFILER_CALLBACK_TRACING_RCCL_API:
+            // {
+            //     auto* rccl_payload =
+            //         static_cast<rocprofiler_callback_tracing_rccl_api_data_t*>(
+            //             record.payload);
+            //     tool_tracing_callback_rccl(record.operation, rccl_payload,
+            //                                user_data->value, ts);
+            //     tool_tracing_callback_stop(category::rocm_rccl_api{}, record,
+            //     user_data,
+            //                                ts, _bt_data);
+            //     break;
+            // }
             case ROCPROFILER_CALLBACK_TRACING_NONE:
             case ROCPROFILER_CALLBACK_TRACING_LAST:
             case ROCPROFILER_CALLBACK_TRACING_MARKER_CONTROL_API:
@@ -2626,15 +2673,15 @@ tool_init(rocprofiler_client_finalize_t fini_func, void* user_data)
 
     // MARKER_CORE_API is handled by roctx_client on control_ctx
     for(auto itr : {
-            // HSA_CORE_API/HSA_AMD_EXT_API/HSA_IMAGE_EXT_API/HSA_FINALIZE_EXT_API,
-            // HIP_RUNTIME_API/HIP_COMPILER_API, and ROCDECODE_API/ROCJPEG_API/
-            // ROCSHMEM_API/HIPFILE_API are configured via domain_service
-            // (domains::callback::hsa::k_core_api/k_amd_ext_api/k_image_ext_api/
-            // k_finalize_ext_api, domains::callback::hip::k_runtime_api/k_compiler_api,
-            // domains::callback::k_rocdecode_api/k_rocjpeg_api/k_rocshmem_api/
-            // k_hipfile_api) below, on their own context, to avoid double-registering
-            // these kinds on primary_ctx.
-            ROCPROFILER_CALLBACK_TRACING_RCCL_API,
+    // HSA_CORE_API/HSA_AMD_EXT_API/HSA_IMAGE_EXT_API/HSA_FINALIZE_EXT_API,
+    // HIP_RUNTIME_API/HIP_COMPILER_API, and ROCDECODE_API/ROCJPEG_API/
+    // ROCSHMEM_API/HIPFILE_API are configured via domain_service
+    // (domains::callback::hsa::k_core_api/k_amd_ext_api/k_image_ext_api/
+    // k_finalize_ext_api, domains::callback::hip::k_runtime_api/k_compiler_api,
+    // domains::callback::k_rocdecode_api/k_rocjpeg_api/k_rocshmem_api/
+    // k_hipfile_api) below, on their own context, to avoid double-registering
+    // these kinds on primary_ctx.
+    // ROCPROFILER_CALLBACK_TRACING_RCCL_API,
 #if(ROCPROFILER_VERSION >= 600)
             ROCPROFILER_CALLBACK_TRACING_OMPT,
 #endif
@@ -2669,10 +2716,10 @@ tool_init(rocprofiler_client_finalize_t fini_func, void* user_data)
     }
 #endif
 
-    if(_callback_domains.count(ROCPROFILER_CALLBACK_TRACING_RCCL_API) > 0)
-    {
-        rocprofiler_sdk::rccl_comm_data_initialize();
-    }
+    // if(_callback_domains.count(ROCPROFILER_CALLBACK_TRACING_RCCL_API) > 0)
+    // {
+    //     rocprofiler_sdk::rccl_comm_data_initialize();
+    // }
 
     if(_buffered_domain.count(ROCPROFILER_BUFFER_TRACING_KERNEL_DISPATCH) > 0)
     {
@@ -2829,6 +2876,18 @@ tool_init(rocprofiler_client_finalize_t fini_func, void* user_data)
         }
         return names;
     };
+
+    if(_callback_domains.contains(ROCPROFILER_CALLBACK_TRACING_RCCL_API))
+    {
+        _data->backtrace_operations.emplace(ROCPROFILER_CALLBACK_TRACING_RCCL_API,
+                                            tracing_config_t::get_backtrace_operations(
+                                                ROCPROFILER_CALLBACK_TRACING_RCCL_API));
+
+        domain_selection selection;
+        selection.name       = "rccl";
+        selection.operations = get_operation_names(ROCPROFILER_CALLBACK_TRACING_RCCL_API);
+        domain_selection_list.push_back(selection);
+    }
 
     if(_callback_domains.contains(ROCPROFILER_CALLBACK_TRACING_HIP_COMPILER_API))
     {
