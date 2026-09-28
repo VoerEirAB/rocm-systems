@@ -106,12 +106,28 @@ rdc_status_t RdcPartitionImpl::rdc_instance_profile_get_impl(
   return RDC_ST_OK;
 }
 
-rdc_status_t RdcPartitionImpl::rdc_get_num_partition_impl(uint32_t index, uint16_t* num_partition) {
-  if (get_num_partition(index, num_partition) != AMDSMI_STATUS_SUCCESS) {
-    return RDC_ST_UNKNOWN_ERROR;
+rdc_status_t RdcPartitionImpl::rdc_get_num_partition_impl(uint32_t index,
+                                                          uint16_t* num_partition) {
+  amdsmi_status_t ret = get_num_partition(index, num_partition);
+
+  if (ret == AMDSMI_STATUS_SUCCESS) {
+    return RDC_ST_OK;
   }
-  return RDC_ST_OK;
+
+  if (ret == AMDSMI_STATUS_NOT_SUPPORTED) {
+    bool is_virtualized = false;
+    ret = is_virtualized_gpu(index, &is_virtualized);
+
+    if (ret == AMDSMI_STATUS_SUCCESS && is_virtualized) {
+      // rocm-systems has valid handling of UINT16_MAX num partitions
+      *num_partition = UINT16_MAX;
+      return RDC_ST_OK;
+    }
+  }
+
+  return RDC_ST_UNKNOWN_ERROR;
 }
+
 
 }  // namespace rdc
 }  // namespace amd
