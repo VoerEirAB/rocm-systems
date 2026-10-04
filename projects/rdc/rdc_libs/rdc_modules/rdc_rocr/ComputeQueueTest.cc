@@ -177,7 +177,8 @@ hsa_status_t ComputeQueueTest::AllocateAndInitBuffers(BinarySearch* bs) {
   // calls to hsa_amd_agents_allow_access() for this purpose.
   hsa_agent_t ag_list[2] = {bs->gpu_dev, bs->cpu_dev};
 
-  err = hsa_amd_memory_pool_allocate(bs->cpu_pool, in_length, 0,
+  // input stores bs->length uint32_t values, so allocate the full array size.
+  err = hsa_amd_memory_pool_allocate(bs->cpu_pool, bs->length * sizeof(uint32_t), 0,
                                      reinterpret_cast<void**>(&bs->input));
   throw_if_error(err);
   err = hsa_amd_agents_allow_access(2, ag_list, NULL, bs->input);

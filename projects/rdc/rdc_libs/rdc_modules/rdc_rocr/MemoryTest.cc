@@ -99,7 +99,9 @@ hsa_status_t MemoryTest::TestAllocate(hsa_amd_memory_pool_t pool, size_t sz) {
   err = hsa_amd_memory_pool_allocate(pool, sz, 0, &ptr);
 
   if (err == HSA_STATUS_SUCCESS) {
-    err = hsa_memory_free(ptr);
+    // Memory allocated from an AMD memory pool must be released
+    // using the corresponding memory-pool API.
+    err = hsa_amd_memory_pool_free(ptr);
   }
 
   return err;
@@ -173,14 +175,16 @@ hsa_status_t MemoryTest::MaxSingleAllocationTest(hsa_agent_t ag, hsa_amd_memory_
   while (true) {
     err = TestAllocate(pool, max_alloc_size * gran_sz);
 
-    if (err != HSA_STATUS_SUCCESS || err != HSA_STATUS_ERROR_OUT_OF_RESOURCES) return err;
-
     if (err == HSA_STATUS_SUCCESS) {
       lower_bound = max_alloc_size;
       max_alloc_size += (upper_bound - lower_bound) / 2;
     } else if (err == HSA_STATUS_ERROR_OUT_OF_RESOURCES) {
+      // OUT_OF_RESOURCES is expected while probing for the allocation limit.
       upper_bound = max_alloc_size;
       max_alloc_size -= (upper_bound - lower_bound) / 2;
+    } else {
+      // Any other HSA status indicates a real allocation/runtime failure.
+      return err;
     }
 
     if ((upper_bound - lower_bound) < 2) {
@@ -189,9 +193,12 @@ hsa_status_t MemoryTest::MaxSingleAllocationTest(hsa_agent_t ag, hsa_amd_memory_
 
     if (upper_bound <= lower_bound) {
       RDC_LOG(RDC_ERROR, "Wrong upper bound and lower bound");
-      return err;
+      return HSA_STATUS_ERROR;
     }
   }
+
+  // lower_bound tracks the largest allocation that actually succeeded.
+  max_alloc_size = lower_bound;
 
   if (verbosity() > 0) {
     RDC_LOG(RDC_DEBUG, "  Biggest single allocation size for this pool is "
@@ -211,7 +218,7 @@ hsa_status_t MemoryTest::MaxSingleAllocationTest(hsa_agent_t ag, hsa_amd_memory_
     std::cout << kSubTestSeparator << std::endl;
   }
 
-  return err;
+  return HSA_STATUS_SUCCESS;
 }
 
 hsa_status_t MemoryTest::MaxSingleAllocationTest(void) {
